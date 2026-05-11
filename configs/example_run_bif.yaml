@@ -1,0 +1,27 @@
+model_name_or_path: /path/to/model-or-checkpoint
+tokenizer_path: /path/to/tokenizer
+pool_jsonl: /path/to/pool.jsonl
+query_jsonl: /path/to/query.jsonl
+out_dir: ./runs/bif_traces
+
+num_chains: 4
+draws_per_chain: 60
+max_length: 256
+train_batch_size: 16
+eval_batch_size: 32
+pool_eval_subset: 0
+
+lr: 5e-6
+gamma: 1e-3
+beta: 1.0
+nbeta_mode: devinterp
+nbeta: -1.0
+noise_level: 1.0
+num_burnin_steps: 0
+num_steps_bw_draws: 1
+seed: 42
+weight_decay: 0.0
+sampler_type: sgld
+batches_per_draw: 0
+gradient_accumulation_steps: 1
+dtype: bfloat16

@@ -1,0 +1,7 @@
+bif_root: ./runs/bif_traces
+out_dir: ./runs/bif_analysis
+
+score_col: bif_mean
+top_k: 500
+enable_aux_query_plots: false
+negate_scores: false

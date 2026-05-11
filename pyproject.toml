@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bif-only"
+version = "0.1.0"
+description = "Standalone BIF-only split from BIFrost"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "BIFrost Contributors"},
+]
+dependencies = [
+    "torch>=2.0",
+    "transformers>=5.0",
+    "accelerate>=1.1.0",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "tqdm>=4.65",
+    "swanlab>=0.4",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+bif = "bif.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
