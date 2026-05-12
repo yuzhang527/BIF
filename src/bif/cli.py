@@ -1,18 +1,11 @@
 """CLI entry point for the BIF-only split."""
-
 from __future__ import annotations
 
 import argparse
 import sys
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="bif",
-        description="BIF-only toolkit: run-bif, analyze-bif, extract-top",
-    )
-    sub = parser.add_subparsers(dest="command", help="Available commands")
-
+def _add_run_bif_parser(sub: argparse._SubParsersAction) -> None:
     p_run = sub.add_parser("run-bif", help="Run BIF trace collection")
     p_run.add_argument("--config", default=None, help="YAML config file")
     p_run.add_argument("--model_name_or_path", default=None)
@@ -33,12 +26,7 @@ def main() -> None:
     p_run.add_argument("--lr", type=float, default=5e-6)
     p_run.add_argument("--gamma", type=float, default=1e-3)
     p_run.add_argument("--beta", type=float, default=1.0)
-    p_run.add_argument(
-        "--nbeta_mode",
-        type=str,
-        default="devinterp",
-        choices=["devinterp", "dataset"],
-    )
+    p_run.add_argument("--nbeta_mode", type=str, default="devinterp", choices=["devinterp", "dataset"])
     p_run.add_argument("--nbeta", type=float, default=-1.0)
     p_run.add_argument("--noise_level", type=float, default=1.0)
     p_run.add_argument("--num_burnin_steps", type=int, default=0)
@@ -46,27 +34,21 @@ def main() -> None:
     p_run.add_argument("--seed", type=int, default=42)
     p_run.add_argument("--grad_clip", type=float, default=None)
     p_run.add_argument("--weight_decay", type=float, default=0.0)
-    p_run.add_argument(
-        "--sampler_type",
-        default="sgld",
-        choices=["sgld", "rmsprop_sgld"],
-    )
+    p_run.add_argument("--sampler_type", default="sgld", choices=["sgld", "rmsprop_sgld"])
     p_run.add_argument("--rmsprop_alpha", type=float, default=0.99)
     p_run.add_argument("--rmsprop_eps", type=float, default=1e-1)
     p_run.add_argument("--batches_per_draw", type=int, default=0)
     p_run.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p_run.add_argument("--chain_id", type=int, default=None)
     p_run.add_argument("--checkpoints", default=None)
-    p_run.add_argument(
-        "--dtype",
-        default="float32",
-        choices=["float32", "float16", "bfloat16"],
-    )
+    p_run.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
     p_run.add_argument("--device", default=None)
     p_run.add_argument("--experiment_name", default=None)
     p_run.add_argument("--model_tag", default=None)
     p_run.add_argument("--run_name", default=None)
 
+
+def _add_analyze_bif_parser(sub: argparse._SubParsersAction) -> None:
     p_analyze = sub.add_parser("analyze-bif", help="Analyze BIF results")
     p_analyze.add_argument("--config", default=None, help="YAML config file")
     p_analyze.add_argument("--bif_root", default=None)
@@ -74,11 +56,7 @@ def main() -> None:
     p_analyze.add_argument("--score_col", default=None)
     p_analyze.add_argument("--top_k", type=int, default=None)
     p_analyze.add_argument("--enable_aux_query_plots", action="store_true")
-    p_analyze.add_argument(
-        "--negate_scores",
-        action="store_true",
-        default=False,
-    )
+    p_analyze.add_argument("--negate_scores", action="store_true", default=False)
     p_analyze.add_argument("--experiment_name", default=None)
     p_analyze.add_argument("--run_name", default=None)
     for flag, typ in [
@@ -99,13 +77,10 @@ def main() -> None:
         ("convergence_min_draws", int),
     ]:
         p_analyze.add_argument(f"--{flag}", type=typ, default=None)
-    p_analyze.add_argument(
-        "--convergence_checkpoints",
-        type=int,
-        nargs="+",
-        default=None,
-    )
+    p_analyze.add_argument("--convergence_checkpoints", type=int, nargs="+", default=None)
 
+
+def _add_extract_parser(sub: argparse._SubParsersAction) -> None:
     p_extract = sub.add_parser("extract-top", help="Extract top-influence samples")
     p_extract.add_argument("--pool_jsonl", required=True)
     p_extract.add_argument("--ranking_csv", required=True)
@@ -122,8 +97,26 @@ def main() -> None:
     p_extract.add_argument("--experiment_name", default=None)
     p_extract.add_argument("--run_name", default=None)
 
-    args = parser.parse_args()
 
+def _add_sweep_parser(sub: argparse._SubParsersAction) -> None:
+    p_sweep = sub.add_parser("sweep-bif", help="Sweep BIF sampler parameters and run diagnostics")
+    p_sweep.add_argument("--config", required=True, help="YAML sweep config")
+    p_sweep.add_argument("--out_dir", default=None, help="Override output_dir in config")
+    p_sweep.add_argument("--dry_run", action="store_true", help="Write plan without launching run-bif")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="bif",
+        description="BIF-only toolkit: run-bif, analyze-bif, extract-top, sweep-bif",
+    )
+    sub = parser.add_subparsers(dest="command", help="Available commands")
+    _add_run_bif_parser(sub)
+    _add_analyze_bif_parser(sub)
+    _add_extract_parser(sub)
+    _add_sweep_parser(sub)
+
+    args = parser.parse_args()
     if args.command is None:
         parser.print_help()
         sys.exit(1)
@@ -147,7 +140,6 @@ def main() -> None:
         out_dir = args.out_dir
         if out_dir is None and bif_root is not None:
             out_dir = f"{bif_root}/analysis"
-
         acfg = AnalyzeConfig()
         for field_name in (
             "score_col",
@@ -175,7 +167,6 @@ def main() -> None:
                 setattr(acfg, field_name, val)
         if args.convergence_checkpoints is not None:
             acfg.convergence_checkpoints = args.convergence_checkpoints
-
         analyze_bif_results(
             bif_root=bif_root,
             out_dir=out_dir,
@@ -204,6 +195,12 @@ def main() -> None:
             experiment_name=args.experiment_name,
             run_name=args.run_name,
         )
+        return
+
+    if args.command == "sweep-bif":
+        from bif.analysis.sweep_runner import main as sweep_main
+
+        sweep_main(sys.argv[2:])
         return
 
 
