@@ -343,21 +343,21 @@ def _safe_str_list(values: list[Any]) -> list[str]:
 
 
 def _line_metric_columns(df: pd.DataFrame) -> list[str]:
-    """Metric columns worth plotting as per-split/per-chain curves."""
+    """Only plot top-K overlap metrics.
+
+    This keeps SwanLab clean: one compact line chart per diagnostic, with
+    different K values as different series.
+    """
 
     if df.empty:
         return []
-    metric_cols: list[str] = []
-    for col in df.columns:
-        if col in {"split_id", "n_draws_a", "n_draws_b", "chain_i", "chain_j"}:
-            continue
-        if (
-            col.endswith("_overlap_recall")
-            or col.endswith("_jaccard")
-            or col in {"score_pearson", "score_spearman"}
-        ):
-            metric_cols.append(col)
-    return metric_cols
+
+    return [
+        col
+        for col in df.columns
+        if col.endswith("_overlap_recall")
+    ]
+
 
 
 def _summary_metric_columns(df: pd.DataFrame) -> list[str]:
@@ -396,34 +396,42 @@ def _log_detail_curves(
     diagnostic_name: str,
     df: pd.DataFrame,
 ) -> None:
-    """Log split/chain diagnostic detail curves and a detail table."""
+    """Log all split/chain overlap values in one compact chart.
+
+    For split_stability:
+      x-axis = split_id
+      series = topK_overlap_recall
+
+    For chain_stability:
+      x-axis = chain pair, e.g. 0-1
+      series = topK_overlap_recall
+    """
 
     if not _is_rank0() or df.empty:
         return
 
     if diagnostic_name == "split_stability" and "split_id" in df.columns:
         xaxis = _safe_str_list(df["split_id"].tolist())
+        chart_name = "split_overlap_recall"
     elif {"chain_i", "chain_j"}.issubset(df.columns):
         xaxis = [f"{int(i)}-{int(j)}" for i, j in zip(df["chain_i"], df["chain_j"])]
+        chart_name = "chain_overlap_recall"
     else:
         xaxis = [str(i) for i in range(len(df))]
+        chart_name = "overlap_recall"
 
+    series: dict[str, list[float | None]] = {}
     for col in _line_metric_columns(df):
-        values = _metric_list(df, col)
+        series[col] = _metric_list(df, col)
+
+    if series:
         log_line(
-            f"6_sweep_diagnostics/{checkpoint_name}/{diagnostic_name}/{col}",
+            f"6_sweep_diagnostics/{checkpoint_name}/{diagnostic_name}/{chart_name}",
             xaxis=xaxis,
-            series={col: values},
+            series=series,
             smooth=False,
         )
 
-    headers, rows = _records_for_table(df)
-    if headers and rows:
-        log_table(
-            f"6_sweep_diagnostics/{checkpoint_name}/{diagnostic_name}/table",
-            headers=headers,
-            rows=rows,
-        )
 
 
 def _log_checkpoint_summary(
@@ -432,59 +440,73 @@ def _log_checkpoint_summary(
     split_df: pd.DataFrame,
     chain_df: pd.DataFrame,
 ) -> None:
-    """Log one checkpoint's diagnostic summary to SwanLab."""
+    """Log only split/chain top-K overlap mean diagnostics to SwanLab.
+
+    This intentionally avoids logging:
+      - per-split curves
+      - per-chain-pair curves
+      - tables
+      - jaccard metrics
+      - pearson/spearman metrics
+      - std/min/pass diagnostics
+
+    Expected chart keys:
+      6_sweep_diagnostics/{checkpoint}/summary/split_top150_overlap_recall_mean
+      6_sweep_diagnostics/{checkpoint}/summary/chain_top150_overlap_recall_mean
+    """
 
     if not _is_rank0():
         return
 
-    scalar_payload: dict[str, float] = {}
-    for key, value in summary.items():
-        if key in {"checkpoint", "checkpoint_dir"}:
+    wanted_keys = [
+        key
+        for key in summary.keys()
+        if (
+            key.startswith("split_top")
+            or key.startswith("chain_top")
+        )
+        and key.endswith("_overlap_recall_mean")
+    ]
+
+    def _sort_key(key: str) -> tuple[int, int]:
+        # split first, chain second
+        kind_order = 0 if key.startswith("split_") else 1
+
+        # Extract K from keys like:
+        #   split_top150_overlap_recall_mean
+        #   chain_top150_overlap_recall_mean
+        try:
+            top_part = key.split("_top", 1)[1]
+            k = int(top_part.split("_", 1)[0])
+        except Exception:
+            k = 10**9
+
+        return kind_order, k
+
+    wanted_keys = sorted(wanted_keys, key=_sort_key)
+
+    for key in wanted_keys:
+        finite = _finite_or_none(summary.get(key))
+        if finite is None:
             continue
-        finite = _finite_or_none(value)
-        if finite is not None:
-            scalar_payload[f"6_sweep_diagnostics/{checkpoint_name}/summary/{key}"] = finite
 
-    if scalar_payload:
-        swan_log(scalar_payload)
+        log_bar(
+            f"6_sweep_diagnostics/{checkpoint_name}/summary/{key}",
+            xaxis=[checkpoint_name],
+            series={key: [finite]},
+        )
 
-    # Compact table with the exact values also written to diagnostics_summary.json.
-    headers = ["metric", "value"]
-    rows = [[k, v] for k, v in summary.items() if k not in {"checkpoint_dir"}]
-    log_table(
-        f"6_sweep_diagnostics/{checkpoint_name}/summary/table",
-        headers=headers,
-        rows=rows,
-    )
 
-    _log_detail_curves(checkpoint_name, "split_stability", split_df)
-    _log_detail_curves(checkpoint_name, "chain_stability", chain_df)
 
 
 def _log_diagnostics_overview(df: pd.DataFrame) -> None:
-    """Log a sweep-wide diagnostics overview across checkpoints."""
+    """Do not log sweep-wide diagnostics overview to SwanLab.
 
-    if not _is_rank0() or df.empty or "checkpoint" not in df.columns:
-        return
+    The CSV summary is still written to disk. We skip SwanLab overview charts
+    to avoid clutter.
+    """
+    return
 
-    xaxis = _safe_str_list(df["checkpoint"].tolist())
-    for col in _summary_metric_columns(df):
-        values = _metric_list(df, col)
-        if all(v is None for v in values):
-            continue
-        log_bar(
-            f"6_sweep_diagnostics/overview/{col}",
-            xaxis=xaxis,
-            series={col: values},
-        )
-
-    headers, rows = _records_for_table(df, max_rows=200)
-    if headers and rows:
-        log_table(
-            "6_sweep_diagnostics/overview/table",
-            headers=headers,
-            rows=rows,
-        )
 
 
 def run_diagnostics_for_checkpoint(

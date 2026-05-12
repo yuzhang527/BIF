@@ -83,6 +83,12 @@ python -m bif.cli extract-top \
   --out_dir ./runs/top_samples
 ```
 
+Update 2026.5.12 Sweep:
+
+```bash
+python -m bif.cli sweep-bif  --config configs/example_sweep_bif.yaml
+```
+
 ## Layout
 
 ```text
@@ -100,3 +106,5 @@ python -m bif.cli extract-top \
 - The CLI flags for the kept BIF commands stay close to the original BIFrost behavior.
 - Tracking still uses SwanLab if it is installed and configured.
 - This repo is intentionally conservative: it preserves the BIF path first, then removes finetune and schedule concerns around it.
+
+

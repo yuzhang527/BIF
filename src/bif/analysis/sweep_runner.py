@@ -29,6 +29,8 @@ from bif.analysis.sweep_diagnostics import (
     run_diagnostics_for_bif_root,
 )
 from bif.io import ensure_dir, save_json
+from bif.utils.tracker import init_run as swan_init_run
+from bif.utils.tracker import finish as swan_finish
 
 
 RUN_BIF_VALUE_FLAGS = {
@@ -498,14 +500,46 @@ def run_sweep(config_path: str, out_dir: str | None = None, dry_run: bool | None
 
             diag_rows = pd.DataFrame()
             if cfg.execution.diagnostics and not cfg.execution.dry_run:
-                diag_rows = run_diagnostics_for_bif_root(
-                    bif_root=run_payload["out_dir"],
-                    out_dir=os.path.join(run_dir, "diagnostics"),
-                    cfg=diagnostics_cfg,
+                diag_out_dir = os.path.join(run_dir, "diagnostics")
+
+                swan_init_run(
+                    experiment_name=f"diagnostics_{point.run_id}",
+                    run_name=point.run_id,
+                    config={
+                        "stage": "sweep_diagnostics",
+                        "run_id": point.run_id,
+                        "run_dir": run_dir,
+                        "trace_dir": run_payload["out_dir"],
+                        "diagnostics_out_dir": diag_out_dir,
+                        "lr": point.lr,
+                        "gamma": point.gamma,
+                        "nbeta": point.nbeta,
+                        "is_nbeta_zero": point.is_nbeta_zero,
+                        "diagnostics": asdict(diagnostics_cfg),
+                    },
+                    tags=[
+                        "bif",
+                        "sweep",
+                        "diagnostics",
+                        f"lr={point.lr}",
+                        f"gamma={point.gamma}",
+                        f"nbeta={point.nbeta}",
+                    ],
                 )
+
+                try:
+                    diag_rows = run_diagnostics_for_bif_root(
+                        bif_root=run_payload["out_dir"],
+                        out_dir=diag_out_dir,
+                        cfg=diagnostics_cfg,
+                    )
+                finally:
+                    swan_finish()
+
             elif cfg.execution.diagnostics and cfg.execution.dry_run:
                 with open(log_path, "a", encoding="utf-8") as f:
                     f.write("[dry-run] diagnostics not executed\n")
+
 
         except Exception as exc:
             status = "error"
