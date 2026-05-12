@@ -1,0 +1,66 @@
+# Example grid sweep for BIF sampler diagnostics.
+# Launch with:
+#   python -m bif.cli sweep-bif --config configs/example_sweep_bif.yaml
+
+base_run_config: configs/example_run_bif.yaml
+output_dir: ./runs/bif_sweeps/example_sweep
+
+# Optional overrides applied on top of base_run_config before each grid point.
+# Keep these small for a first diagnostic sweep.
+run_overrides:
+  draws_per_chain: 60
+  num_chains: 4
+  num_burnin_steps: 0
+  num_steps_bw_draws: 1
+  sampler_type: sgld
+
+sweep:
+  lr:
+    values: [1.0e-6, 3.0e-6, 1.0e-5]
+  gamma:
+    values: [1.0e-4, 3.0e-4, 1.0e-3]
+  nbeta:
+    values: [0.1, 0.3, 1.0, 3.0]
+
+baseline:
+  # Adds one nbeta=0 run for every lr x gamma pair unless nbeta=0 is already in the grid.
+  run_nbeta_zero: true
+  # Compare each nonzero-nbeta run with the matched nbeta=0 run at the same lr/gamma.
+  compare_to_nbeta_zero: true
+  include_if_in_grid: true
+
+analysis:
+  score_col: bif_mean
+  top_k: 500
+  enable_aux_query_plots: false
+  negate_scores: false
+
+# Loss trace health is expected to be monitored by existing BIF/SwanLab charts.
+# The diagnostics below focus on ranking stability.
+diagnostics:
+  checkpoint: null
+  reduce_chains: stack
+  split_stability:
+    enabled: true
+    num_splits: 20
+    split_fraction: 0.5
+    top_k: [50, 100, 500]
+    score_col: bif_mean
+    pass_threshold: 0.9
+    seed: 42
+    min_draws: 8
+  chain_stability:
+    enabled: true
+    top_k: [50, 100, 500]
+    score_col: bif_mean
+    min_draws_per_chain: 4
+
+execution:
+  run_bif: true
+  analyze_bif: true
+  diagnostics: true
+  skip_existing: true
+  continue_on_error: true
+  dry_run: false
+  # Useful when running under torchrun or a custom env.
+  extra_env: {}

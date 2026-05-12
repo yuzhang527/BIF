@@ -3,9 +3,7 @@
 This module intentionally reuses the existing BIF trace loader and scorer from
 ``bif.analysis.bif_analyzer``.  It does not run SGLD and it does not duplicate
 SwanLab loss-trace visualization; it focuses on stability diagnostics that are
-hard to read from trace plots alone.  When a SwanLab run has already been
-initialized by the surrounding pipeline, the diagnostic summaries, overlap
-curves, correlation curves, and tables are also logged for visualization.
+hard to read from trace plots alone.
 """
 from __future__ import annotations
 
@@ -25,8 +23,6 @@ from bif.analysis.bif_analyzer import (
     load_checkpoint_traces,
 )
 from bif.io import ensure_dir, save_json
-from bif.utils.tracker import log as swan_log
-from bif.utils.tracker import log_bar, log_line, log_table
 
 
 @dataclass
@@ -321,184 +317,13 @@ def _trace_summary(pool_seq_loss: np.ndarray, query_seq_loss: np.ndarray) -> dic
     }
 
 
-
-def _is_rank0() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
-
-
-def _finite_or_none(x: Any) -> float | None:
-    try:
-        value = float(x)
-    except Exception:
-        return None
-    return value if np.isfinite(value) else None
-
-
-def _metric_list(df: pd.DataFrame, col: str) -> list[float | None]:
-    return [_finite_or_none(x) for x in df[col].tolist()]
-
-
-def _safe_str_list(values: list[Any]) -> list[str]:
-    return [str(v) for v in values]
-
-
-def _line_metric_columns(df: pd.DataFrame) -> list[str]:
-    """Metric columns worth plotting as per-split/per-chain curves."""
-
-    if df.empty:
-        return []
-    metric_cols: list[str] = []
-    for col in df.columns:
-        if col in {"split_id", "n_draws_a", "n_draws_b", "chain_i", "chain_j"}:
-            continue
-        if (
-            col.endswith("_overlap_recall")
-            or col.endswith("_jaccard")
-            or col in {"score_pearson", "score_spearman"}
-        ):
-            metric_cols.append(col)
-    return metric_cols
-
-
-def _summary_metric_columns(df: pd.DataFrame) -> list[str]:
-    """Overview columns worth plotting across sweep checkpoints."""
-
-    if df.empty:
-        return []
-    metric_cols: list[str] = []
-    for col in df.columns:
-        if col in {"checkpoint", "checkpoint_dir"}:
-            continue
-        if (
-            col.endswith("_pass")
-            or col.endswith("_mean")
-            or col.endswith("_min")
-            or col.endswith("_std")
-            or col in {"num_chains", "draws_per_chain", "num_draws", "pool_size", "query_size"}
-        ):
-            metric_cols.append(col)
-    return metric_cols
-
-
-def _records_for_table(df: pd.DataFrame, max_rows: int = 80) -> tuple[list[str], list[list[Any]]]:
-    if df.empty:
-        return [], []
-    shown = df.head(max_rows).copy()
-    shown = shown.replace([np.inf, -np.inf], np.nan)
-    shown = shown.where(pd.notnull(shown), "")
-    headers = list(shown.columns)
-    rows = shown.astype(str).values.tolist()
-    return headers, rows
-
-
-def _log_detail_curves(
-    checkpoint_name: str,
-    diagnostic_name: str,
-    df: pd.DataFrame,
-) -> None:
-    """Log split/chain diagnostic detail curves and a detail table."""
-
-    if not _is_rank0() or df.empty:
-        return
-
-    if diagnostic_name == "split_stability" and "split_id" in df.columns:
-        xaxis = _safe_str_list(df["split_id"].tolist())
-    elif {"chain_i", "chain_j"}.issubset(df.columns):
-        xaxis = [f"{int(i)}-{int(j)}" for i, j in zip(df["chain_i"], df["chain_j"])]
-    else:
-        xaxis = [str(i) for i in range(len(df))]
-
-    for col in _line_metric_columns(df):
-        values = _metric_list(df, col)
-        log_line(
-            f"6_sweep_diagnostics/{checkpoint_name}/{diagnostic_name}/{col}",
-            xaxis=xaxis,
-            series={col: values},
-            smooth=False,
-        )
-
-    headers, rows = _records_for_table(df)
-    if headers and rows:
-        log_table(
-            f"6_sweep_diagnostics/{checkpoint_name}/{diagnostic_name}/table",
-            headers=headers,
-            rows=rows,
-        )
-
-
-def _log_checkpoint_summary(
-    checkpoint_name: str,
-    summary: dict[str, Any],
-    split_df: pd.DataFrame,
-    chain_df: pd.DataFrame,
-) -> None:
-    """Log one checkpoint's diagnostic summary to SwanLab."""
-
-    if not _is_rank0():
-        return
-
-    scalar_payload: dict[str, float] = {}
-    for key, value in summary.items():
-        if key in {"checkpoint", "checkpoint_dir"}:
-            continue
-        finite = _finite_or_none(value)
-        if finite is not None:
-            scalar_payload[f"6_sweep_diagnostics/{checkpoint_name}/summary/{key}"] = finite
-
-    if scalar_payload:
-        swan_log(scalar_payload)
-
-    # Compact table with the exact values also written to diagnostics_summary.json.
-    headers = ["metric", "value"]
-    rows = [[k, v] for k, v in summary.items() if k not in {"checkpoint_dir"}]
-    log_table(
-        f"6_sweep_diagnostics/{checkpoint_name}/summary/table",
-        headers=headers,
-        rows=rows,
-    )
-
-    _log_detail_curves(checkpoint_name, "split_stability", split_df)
-    _log_detail_curves(checkpoint_name, "chain_stability", chain_df)
-
-
-def _log_diagnostics_overview(df: pd.DataFrame) -> None:
-    """Log a sweep-wide diagnostics overview across checkpoints."""
-
-    if not _is_rank0() or df.empty or "checkpoint" not in df.columns:
-        return
-
-    xaxis = _safe_str_list(df["checkpoint"].tolist())
-    for col in _summary_metric_columns(df):
-        values = _metric_list(df, col)
-        if all(v is None for v in values):
-            continue
-        log_bar(
-            f"6_sweep_diagnostics/overview/{col}",
-            xaxis=xaxis,
-            series={col: values},
-        )
-
-    headers, rows = _records_for_table(df, max_rows=200)
-    if headers and rows:
-        log_table(
-            "6_sweep_diagnostics/overview/table",
-            headers=headers,
-            rows=rows,
-        )
-
-
 def run_diagnostics_for_checkpoint(
     checkpoint_name: str,
     checkpoint_dir: str,
     out_dir: str,
     cfg: DiagnosticConfig,
 ) -> dict[str, Any]:
-    """Run diagnostics for one checkpoint trace directory.
-
-    Besides writing CSV/JSON artifacts, this function logs diagnostic scalars,
-    curves, and tables to SwanLab when the surrounding process has initialized a
-    SwanLab run.  Logging is intentionally best-effort via bif.utils.tracker.
-    """
+    """Run diagnostics for one checkpoint trace directory."""
 
     ensure_dir(out_dir)
     traces = load_checkpoint_traces(checkpoint_dir)
@@ -529,9 +354,6 @@ def run_diagnostics_for_checkpoint(
     summary[f"{score_col}_mean"] = _safe_float(np.nanmean(full_score))
     summary[f"{score_col}_std"] = _safe_float(np.nanstd(full_score))
 
-    split_df = pd.DataFrame()
-    chain_df = pd.DataFrame()
-
     if cfg.split_stability.enabled:
         split_df, split_summary = compute_split_stability(
             pool_seq,
@@ -561,14 +383,6 @@ def run_diagnostics_for_checkpoint(
         summary["chain_enabled"] = 0.0
 
     save_json(os.path.join(out_dir, "diagnostics_summary.json"), summary)
-
-    _log_checkpoint_summary(
-        checkpoint_name=checkpoint_name,
-        summary=summary,
-        split_df=split_df,
-        chain_df=chain_df,
-    )
-
     return summary
 
 
@@ -595,9 +409,6 @@ def run_diagnostics_for_bif_root(
         raise ValueError(f"No diagnostics were run under {bif_root}; checkpoint filter={cfg.checkpoint!r}")
     df = pd.DataFrame(rows)
     df.to_csv(os.path.join(out_dir, "diagnostics_summary.csv"), index=False)
-
-    _log_diagnostics_overview(df)
-
     return df
 
 

@@ -1,14 +1,47 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.DS_Store
+
+# Environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Local data / models / outputs
+data/
+.data/
 runs/
+configs/runs/
+step*/
+checkpoints/
 outputs/
+wandb/
 swanlog/
+swanlab/
+
+# Large model / tensor artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.npz
+*.npy
+*.arrow
+*.parquet
+
+# Secrets
+.env
+*.env
+secrets.*
+*.key
+*.pem
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

@@ -599,55 +599,77 @@ def compute_bif_scores(
     reduce_chains: str = "stack",
     negate_scores: bool = False,
 ) -> dict[str, np.ndarray]:
-    """Compute BIF influence scores.
+    """Compute BIF scores from pool × query correlations only.
 
-    Aligned with devinterp's compute_bif() approach:
-    - pool_bif_matrix: pairwise BIF within pool (N_pool × N_pool)
-    - query_bif_matrix: pairwise BIF within query (N_query × N_query)
-    - cross_corr: pool × query cross-correlation (for backward compat)
+    New definition:
 
-    The primary score is the mean BIF correlation with other samples,
-    which measures how "influential" a sample is in the loss landscape.
+        bif_mean(pool_i) = mean_j corr(loss_trace(pool_i), loss_trace(query_j))
+
+    This intentionally does NOT compute pool×pool or query×query matrices.
     """
-    pool_bif_matrix = compute_bif_pairwise(pool_seq_loss, num_chains, reduce_chains)
-    query_bif_matrix = compute_bif_pairwise(query_seq_loss, num_chains, reduce_chains)
 
-    np.fill_diagonal(pool_bif_matrix, 0.0)
-    np.fill_diagonal(query_bif_matrix, 0.0)
+    if pool_seq_loss.shape[0] != query_seq_loss.shape[0]:
+        raise ValueError(
+            "pool_seq_loss and query_seq_loss must have the same number of draws "
+            f"before scoring; got {pool_seq_loss.shape[0]} and {query_seq_loss.shape[0]}"
+        )
 
-    pool_bif_mean = pool_bif_matrix.mean(axis=1)
-    pool_bif_abs_mean = np.abs(pool_bif_matrix).mean(axis=1)
+    if reduce_chains == "stack":
+        pool_loss = pool_seq_loss
+        query_loss = query_seq_loss
+    elif reduce_chains == "mean":
+        if num_chains <= 0:
+            raise ValueError("num_chains must be positive")
+        if pool_seq_loss.shape[0] % num_chains != 0:
+            raise ValueError(
+                f"num_draws={pool_seq_loss.shape[0]} is not divisible by "
+                f"num_chains={num_chains}"
+            )
+        draws_per_chain = pool_seq_loss.shape[0] // num_chains
+        pool_loss = pool_seq_loss.reshape(num_chains, draws_per_chain, -1).mean(axis=0)
+        query_loss = query_seq_loss.reshape(num_chains, draws_per_chain, -1).mean(axis=0)
+    else:
+        raise ValueError(f"Unknown reduce_chains: {reduce_chains}")
 
-    pool_centered = pool_seq_loss - pool_seq_loss.mean(axis=0, keepdims=True)
-    query_centered = query_seq_loss - query_seq_loss.mean(axis=0, keepdims=True)
-    cross_cov = (pool_centered.T @ query_centered) / pool_centered.shape[0]
+    pool_z = _safe_zscore_cols(pool_loss)
+    query_z = _safe_zscore_cols(query_loss)
 
-    pool_z = _safe_zscore_cols(pool_seq_loss)
-    query_z = _safe_zscore_cols(query_seq_loss)
-    cross_corr = (pool_z.T @ query_z) / pool_z.shape[0]
+    # Shape: (n_pool, n_query)
+    cross_corr = (pool_z.T @ query_z) / max(pool_z.shape[0], 1)
+
+    pool_centered = pool_loss - pool_loss.mean(axis=0, keepdims=True)
+    query_centered = query_loss - query_loss.mean(axis=0, keepdims=True)
+    cross_cov = (pool_centered.T @ query_centered) / max(pool_centered.shape[0], 1)
 
     sign = -1.0 if negate_scores else 1.0
 
-    mean_loss = pool_seq_loss.mean(axis=0)
-    self_variance = pool_seq_loss.var(axis=0)
+    cross_corr_mean = sign * cross_corr.mean(axis=1)
+    cross_corr_absmean = sign * np.abs(cross_corr).mean(axis=1)
+    cross_cov_mean = sign * cross_cov.mean(axis=1)
 
-    draw_idx = np.arange(pool_seq_loss.shape[0], dtype=np.float64)
+    mean_loss = pool_loss.mean(axis=0)
+    self_variance = pool_loss.var(axis=0)
+
+    draw_idx = np.arange(pool_loss.shape[0], dtype=np.float64)
     draw_idx = (draw_idx - draw_idx.mean()) / (draw_idx.std() + 1e-12)
-    draw_trend = ((pool_z.T @ draw_idx) / len(draw_idx)).reshape(-1)
+    draw_trend = ((pool_z.T @ draw_idx) / max(len(draw_idx), 1)).reshape(-1)
 
     return {
-        "bif_mean": sign * pool_bif_mean,
-        "bif_abs_mean": pool_bif_abs_mean,
-        "bif_matrix": pool_bif_matrix,
-        "query_bif_matrix": query_bif_matrix,
-        "cross_corr_mean_over_queries": sign * cross_corr.mean(axis=1),
-        "cross_corr_absmean_over_queries": sign * np.abs(cross_corr).mean(axis=1),
+        # Primary score. Keep the old column name so downstream configs do not break.
+        "bif_mean": cross_corr_mean,
+
+        # Explicit aliases / diagnostics.
+        "cross_corr_mean_over_queries": cross_corr_mean,
+        "cross_corr_absmean_over_queries": cross_corr_absmean,
         "cross_corr_matrix": cross_corr,
-        "cross_cov_avg_over_queries": sign * cross_cov.mean(axis=1),
+        "cross_cov_avg_over_queries": cross_cov_mean,
+
+        # Non-pairwise scalar diagnostics.
         "mean_loss": mean_loss,
         "self_variance": self_variance,
         "draw_trend": draw_trend,
     }
+
 
 
 def _safe_zscore_cols(mat: np.ndarray) -> np.ndarray:
@@ -1037,6 +1059,7 @@ def _process_one_checkpoint(
     pool_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     t0 = __import__("time").monotonic()
+
     try:
         loaded = load_checkpoint_traces(ck_dir)
     except ValueError as exc:
@@ -1045,6 +1068,7 @@ def _process_one_checkpoint(
 
     pool_seq = loaded["pool_seq_loss"]
     query_seq = loaded["query_seq_loss"]
+
     if np.isnan(pool_seq).any() or np.isnan(query_seq).any():
         pool_nan = float(np.isnan(pool_seq).mean())
         query_nan = float(np.isnan(query_seq).mean())
@@ -1055,7 +1079,8 @@ def _process_one_checkpoint(
         print(f"[analyze] Skipping {ck_name}: {msg}")
         return {"checkpoint": ck_name, "error": msg}
 
-    num_chains = loaded.get("num_chains", 1)
+    num_chains = int(loaded.get("num_chains", 1))
+
     scores = compute_bif_scores(
         loaded["pool_seq_loss"],
         loaded["query_seq_loss"],
@@ -1063,125 +1088,134 @@ def _process_one_checkpoint(
         reduce_chains="stack",
         negate_scores=acfg.negate_scores,
     )
+
     df = build_pool_score_df(loaded["pool_ids"], loaded["pool_meta"], scores)
+
     if acfg.score_col not in df.columns:
         raise ValueError(
-            f"score_col={acfg.score_col!r} not in {df.columns.tolist()}"
+            f"score_col={acfg.score_col!r} not in {df.columns.tolist()}. "
+            "With the new definition, the default score_col='bif_mean' is "
+            "cross_corr_mean_over_queries."
         )
+
     df = df.sort_values(acfg.score_col, ascending=False).reset_index(drop=True)
     df["rank"] = np.arange(1, len(df) + 1)
 
     ck_out = f"{out_dir}/{ck_name}"
     ensure_dir(ck_out)
+
     df.to_csv(f"{ck_out}/pool_scores.csv", index=False)
     df.head(acfg.top_k).to_csv(f"{ck_out}/top_{acfg.top_k}.csv", index=False)
 
-    bif_matrix_path = f"{ck_out}/bif_matrix.npy"
-    np.save(bif_matrix_path, scores["bif_matrix"])
-
-    if acfg.save_full_query_matrix:
-        np.save(
-            f"{ck_out}/query_pair_corr_matrix.npy",
-            scores["cross_corr_matrix"],
-        )
+    # New canonical matrix: pool × query.
+    pool_query_matrix_path = f"{ck_out}/pool_query_corr_matrix.npy"
+    np.save(pool_query_matrix_path, scores["cross_corr_matrix"])
 
     scores_arr = df[acfg.score_col].to_numpy()
-    bif_mat = scores["bif_matrix"]
-    pool_mat = loaded["pool_seq_loss"]
-    query_mat = loaded["query_seq_loss"]
+    cross_corr_matrix = scores["cross_corr_matrix"]
 
     rank = int(os.environ.get("RANK", "0"))
     if rank == 0:
-        core_summary = _log_core_bif_summary(
-            bif_mat,
-            pool_mat,
-            query_mat,
-            num_chains,
-            ck_name,
-            rhat_max_samples=acfg.rhat_max_samples,
-            rhat_min_draws=acfg.rhat_min_draws,
-        )
+        cross_vals = cross_corr_matrix.reshape(-1)
+        core_summary = {
+            "score_definition": "bif_mean = cross_corr_mean_over_queries",
+            "cross_corr_mean": float(np.nanmean(cross_vals)),
+            "cross_corr_std": float(np.nanstd(cross_vals)),
+            "cross_corr_min": float(np.nanmin(cross_vals)),
+            "cross_corr_max": float(np.nanmax(cross_vals)),
+            "score_mean": float(np.nanmean(scores_arr)),
+            "score_std": float(np.nanstd(scores_arr)),
+        }
+
         save_json(
             f"{ck_out}/ckpt_meta.json",
             {
                 "checkpoint": ck_name,
                 "num_draws": int(loaded["num_draws"]),
-                "pool_size": int(loaded["pool_seq_loss"].shape[1]),
-                "query_size": int(loaded["query_seq_loss"].shape[1]),
+                "pool_size": int(pool_seq.shape[1]),
+                "query_size": int(query_seq.shape[1]),
                 "num_chains": num_chains,
+                "matrix_saved": "pool_query_corr_matrix.npy",
                 **core_summary,
             },
         )
+
         burnin_offset = _read_num_burnin_draws(ck_dir)
+
+        # These are observable losses, i.e. draw-time diagnostics.
         _log_loss_traces(
-            pool_mat, query_mat, num_chains, ck_name,
+            pool_seq,
+            query_seq,
+            num_chains,
+            ck_name,
             draw_offset=burnin_offset,
         )
+
         _log_score_histogram(scores_arr, ck_name, bins=acfg.hist_bins)
-        _log_corr_distribution(
-            bif_mat, ck_name,
+
+        # Cross-query diagnostics replace old pool×pool plots.
+        _log_aux_query_corr_distribution(
+            cross_corr_matrix,
+            ck_name,
             bins=acfg.hist_bins,
         )
+
         _log_score_vs_selfvar_scatter(
             scores_arr,
-            pool_mat, ck_name,
+            pool_seq,
+            ck_name,
             max_points=acfg.scatter_max_points,
+            chart_key="2_scores/cross_corr_score_vs_selfvar",
+            yaxis_name=acfg.score_col,
         )
-        _log_bif_heatmap_topk(
-            bif_mat, df, loaded["pool_ids"], acfg.top_k, ck_name,
-            score_col=acfg.score_col,
-            heatmap_topk_max=acfg.heatmap_topk_max,
-        )
+
         _log_score_by_source(
-            df, acfg.score_col, acfg.top_k, ck_name,
+            df,
+            acfg.score_col,
+            acfg.top_k,
+            ck_name,
             max_sources=acfg.boxplot_max_sources,
             min_per_source=acfg.boxplot_min_per_source,
             label_max_len=acfg.source_label_max_len,
         )
-        _log_eigenvalue_spectrum(
-            bif_mat, ck_name,
-            max_pool=acfg.eigenvalue_max_pool,
-            max_ev=acfg.eigenvalue_max_ev,
+
+        _log_cross_cov_heatmap(
+            cross_corr_matrix,
+            loaded["pool_ids"],
+            loaded["query_ids"],
+            ck_name,
+            pool_sources=df["source"].fillna("unknown").tolist()
+            if "source" in df.columns
+            else None,
+            max_pool=acfg.heatmap_max_pool,
+            max_query=acfg.heatmap_max_query,
+            query_sources=loaded.get("query_meta", {}).get("source_types"),
+            query_task_types=loaded.get("query_meta", {}).get("task_types"),
         )
+
         _log_convergence(
-            pool_mat, num_chains, ck_name,
+            pool_seq,
+            num_chains,
+            ck_name,
             checkpoints=acfg.convergence_checkpoints,
             min_draws=acfg.convergence_min_draws,
         )
+
         if num_chains > 1:
             _log_rhat(
-                pool_mat, num_chains, ck_name,
+                pool_seq,
+                num_chains,
+                ck_name,
                 max_samples=acfg.rhat_max_samples,
                 min_draws=acfg.rhat_min_draws,
             )
             _log_chain_scatter(
-                pool_mat, num_chains, scores_arr, ck_name,
+                pool_seq,
+                num_chains,
+                scores_arr,
+                ck_name,
                 max_points=acfg.scatter_max_points,
                 min_draws=acfg.chain_scatter_min_draws,
-            )
-
-        if acfg.enable_aux_query_plots:
-            _log_aux_query_corr_distribution(
-                scores["cross_corr_matrix"],
-                ck_name,
-                bins=acfg.hist_bins,
-            )
-            _log_score_vs_selfvar_scatter(
-                scores["cross_cov_avg_over_queries"],
-                pool_mat,
-                ck_name,
-                max_points=acfg.scatter_max_points,
-                chart_key="5_aux_query/cross_cov_vs_selfvar",
-                yaxis_name="aux_query_cross_cov",
-            )
-            _log_cross_cov_heatmap(
-                scores["cross_corr_matrix"], loaded["pool_ids"],
-                loaded["query_ids"], ck_name,
-                pool_sources=df["source"].fillna("unknown").tolist() if "source" in df.columns else None,
-                max_pool=acfg.heatmap_max_pool,
-                max_query=acfg.heatmap_max_query,
-                query_sources=loaded.get("query_meta", {}).get("source_types"),
-                query_task_types=loaded.get("query_meta", {}).get("task_types"),
             )
 
         _log_checkpoint_sample_table(
@@ -1190,19 +1224,22 @@ def _process_one_checkpoint(
             acfg.top_k,
             ck_name,
             pool_df=pool_df,
-            include_aux_query_corr=acfg.enable_aux_query_plots,
+            include_aux_query_corr=True,
         )
 
     elapsed = __import__("time").monotonic() - t0
+
     return {
         "checkpoint": ck_name,
         "num_draws": int(loaded["num_draws"]),
         "pool_size": len(loaded["pool_ids"]),
         "query_size": len(loaded.get("query_ids", [])),
+        "score_definition": "cross_corr_mean_over_queries",
         "score_mean": float(df[acfg.score_col].mean()),
         "score_std": float(df[acfg.score_col].std()),
         "analysis_seconds": round(elapsed, 2),
     }
+
 
 
 def _read_num_burnin_draws(checkpoint_dir: str) -> int:

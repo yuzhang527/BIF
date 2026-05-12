@@ -1,16 +1,16 @@
 """BIF trace runner: SGLD-based influence function trace collection.
 
-Aligned with devinterp's sampling.py architecture:
-- Separate gradient dataset (for SGLD steps) from observables (for loss evaluation)
-- Multiple SGLD steps between draws (num_steps_bw_draws) for better mixing
-- Efficient observable evaluation: fixed input_ids, batch forward pass per draw
-- Output per-token loss traces (shape: chain × draw × sample × token_pos)
-  for proper BIF correlation computation
+This version follows the Timaeus sampling-guide separation between:
 
-Key difference from old design:
-  OLD: at every draw, scan the ENTIRE pool + query datasets → O(N) forward passes per draw
-  NEW: at every draw, evaluate a fixed subset of observable samples in a few batches
-       → O(batches_per_draw) forward passes per draw
+1. sampler steps: compute only the mini-batch loss used for the SGLD update;
+2. draws: compute pool/query observable losses only after burn-in.
+
+Important behavior changes compared with the previous runner:
+- SwanLab sweep loss is the true per-step training loss from sampler.step().
+- Burn-in boundaries do not compute full pool/query observable losses.
+- Full pool/query observable losses are computed only on post-burn-in draws.
+- The saved burn-in_loss_trace.npz file is no longer produced.
+- A new step_loss_trace.npz file is produced for each chain.
 """
 
 from __future__ import annotations
@@ -38,17 +38,12 @@ from bif.data.dataset import (
 )
 from bif.io import ensure_dir, save_json
 from bif.training.loss import per_example_causal_lm_loss, per_token_causal_lm_loss
-from bif.training.sgld import LocalizedSGLDSampler, RMSpropSGLDSampler, create_sampler
+from bif.training.sgld import create_sampler
 from bif.utils.logging import get_logger
 from bif.utils.naming import (
-    fmt_ckpt_short,
-    fmt_lr,
     make_bif_name,
     make_bif_pipeline_name,
     resolve_model_tag,
-)
-from bif.utils.naming import (
-    guess_model_tag as _guess_model_tag,
 )
 from bif.utils.tracker import finish as swan_finish
 from bif.utils.tracker import init_run
@@ -116,7 +111,9 @@ def _compute_nbeta_value(
 
 
 def _broadcast_plan(
-    plan: list[tuple[str, str]], rank: int, world_size: int
+    plan: list[tuple[str, str]],
+    rank: int,
+    world_size: int,
 ) -> list[tuple[str, str]]:
     if world_size <= 1:
         return plan
@@ -138,19 +135,24 @@ def _broadcast_plan(
 
     dist.broadcast(size_t, src=0)
     n_bytes = int(size_t.item())
-
     buf = torch.zeros(n_bytes, dtype=torch.uint8, device=device)
+
     if rank == 0:
         buf[:] = torch.frombuffer(data, dtype=torch.uint8).to(device)
+
     dist.broadcast(buf, src=0)
 
     if rank != 0:
         plan = pickle.loads(bytes(buf.cpu().tolist()))
+
     return plan
 
 
 def _is_checkpoint_complete(
-    out_dir: str, expected_world_size: int, draws_per_chain: int, num_chains: int
+    out_dir: str,
+    expected_world_size: int,
+    draws_per_chain: int,
+    num_chains: int,
 ) -> bool:
     ddp_complete = True
     for rank in range(expected_world_size):
@@ -175,12 +177,13 @@ def _is_checkpoint_complete(
         chain_dir = os.path.join(out_dir, name)
         if not (os.path.isdir(chain_dir) and re.fullmatch(r"chain_\d+", name)):
             continue
+
         trace = os.path.join(chain_dir, "observable_loss_trace.npz")
         if not os.path.isfile(trace):
             trace_jsonl = os.path.join(chain_dir, "pool_loss_trace.jsonl")
             if not os.path.isfile(trace_jsonl):
                 return False
-            with open(trace_jsonl) as f:
+            with open(trace_jsonl, encoding="utf-8") as f:
                 lines = sum(1 for _ in f)
             if lines < draws_per_chain:
                 return False
@@ -207,16 +210,18 @@ def _discover_checkpoint_plan(
     checkpoint_filter: list[str] | None = None,
 ) -> list[tuple[str, str]]:
     plan: list[tuple[str, str]] = []
+
     if base_model_path is not None:
         if not os.path.isdir(base_model_path):
             raise FileNotFoundError(base_model_path)
         plan.append(("base_model", base_model_path))
 
-    entries = []
+    entries: list[tuple[int, str, str]] = []
     for name in os.listdir(model_root):
         full = os.path.join(model_root, name)
         if os.path.isdir(full) and re.fullmatch(r"checkpoint-\d+", name):
             entries.append((int(name.split("-")[-1]), name, full))
+
     for _, name, full in sorted(entries):
         plan.append((name, full))
 
@@ -233,7 +238,7 @@ def _discover_checkpoint_plan(
     if resume_out_dir is None:
         return plan
 
-    remaining = []
+    remaining: list[tuple[str, str]] = []
     for ckpt_name, ckpt_path in plan:
         ckpt_out = os.path.join(resume_out_dir, ckpt_name)
         if _is_checkpoint_complete(ckpt_out, world_size, draws_per_chain, num_chains):
@@ -242,24 +247,13 @@ def _discover_checkpoint_plan(
             remaining.append((ckpt_name, ckpt_path))
 
     if not remaining:
-        logger.info("All checkpoints already complete — nothing to do.")
+        logger.info("All checkpoints already complete - nothing to do.")
+
     return remaining
 
 
 class Observable:
-    """Evaluates a fixed set of sequences at each SGLD draw.
-
-    Aligned with devinterp's Observable class:
-    - On construction, loads fixed input_ids (same sequences every draw)
-    - At each draw, compute_loss(model) returns per-token losses
-
-    Attributes:
-        name: Observable identifier (e.g. "pool", "query")
-        input_ids: Fixed input_ids tensor, shape (n_samples, seq_len)
-        attention_mask: Fixed attention_mask tensor, shape (n_samples, seq_len)
-        n_samples: Total number of samples to evaluate per draw
-        context_length: Number of predicted positions (seq_len - 1)
-    """
+    """Evaluates a fixed set of sequences at each post-burn-in SGLD draw."""
 
     def __init__(
         self,
@@ -288,12 +282,13 @@ class Observable:
         self.subtypes: list[Any] = []
         self.task_types: list[Any] = []
 
-        all_input_ids = []
-        all_attention_mask = []
+        all_input_ids: list[torch.Tensor] = []
+        all_attention_mask: list[torch.Tensor] = []
 
         for start in range(0, self.n_samples, eval_batch_size):
             batch_indices = indices[start:start + eval_batch_size]
             batch = get_batch_by_indices(dataset, batch_indices)
+
             self.sample_ids.extend(batch["sample_ids"])
             self.source_types.extend(batch["source_types"])
             self.subtypes.extend(batch["subtypes"])
@@ -307,18 +302,9 @@ class Observable:
         self.context_length = self.seq_len - 1
 
     def compute_loss(self, model: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute losses at the current model parameters.
-
-        Args:
-            model: The model (should be in eval mode, no grad).
-
-        Returns:
-            (seq_loss, token_loss) where:
-            - seq_loss: shape (n_samples,), per-example mean loss
-            - token_loss: shape (n_samples, context_length), per-token loss
-        """
-        all_token_losses = []
-        all_seq_losses = []
+        """Compute per-example and per-token observable loss at current params."""
+        all_token_losses: list[torch.Tensor] = []
+        all_seq_losses: list[torch.Tensor] = []
 
         with torch.no_grad():
             for start in range(0, self.n_samples, self.eval_batch_size):
@@ -327,7 +313,6 @@ class Observable:
                 mask = self.attention_mask[start:end]
 
                 outputs = model(input_ids=ids, attention_mask=mask)
-
                 token_loss = per_token_causal_lm_loss(
                     input_ids=ids,
                     logits=outputs.logits,
@@ -348,6 +333,18 @@ class Observable:
         return seq_loss, token_loss
 
 
+def _stack_or_empty_seq(seq_losses: list[torch.Tensor], observable: Observable) -> np.ndarray:
+    if seq_losses:
+        return torch.stack(seq_losses, dim=0).float().numpy()
+    return np.empty((0, observable.n_samples), dtype=np.float32)
+
+
+def _stack_or_empty_token(token_losses: list[torch.Tensor], observable: Observable) -> np.ndarray:
+    if token_losses:
+        return torch.stack(token_losses, dim=0).float().numpy()
+    return np.empty((0, observable.n_samples, observable.context_length), dtype=np.float32)
+
+
 def _save_traces_npz(
     chain_dir: str,
     chain_id: int,
@@ -355,15 +352,9 @@ def _save_traces_npz(
     token_losses: list[torch.Tensor],
     observable: Observable,
 ) -> None:
-    """Save trace data as compressed numpy arrays.
-
-    Stores:
-    - seq_loss: shape (num_draws, n_samples) — per-example sequence-level loss
-    - token_loss: shape (num_draws, n_samples, context_length) — per-token loss
-    - sample_ids, source_types, etc. as JSON
-    """
-    seq_arr = torch.stack(seq_losses, dim=0).float().numpy()
-    token_arr = torch.stack(token_losses, dim=0).float().numpy()
+    """Save one observable trace as compressed numpy arrays."""
+    seq_arr = _stack_or_empty_seq(seq_losses, observable)
+    token_arr = _stack_or_empty_token(token_losses, observable)
 
     np.savez_compressed(
         os.path.join(chain_dir, "observable_loss_trace.npz"),
@@ -373,7 +364,7 @@ def _save_traces_npz(
 
     meta = {
         "chain_id": chain_id,
-        "num_draws": len(seq_losses),
+        "num_draws": int(seq_arr.shape[0]),
         "n_samples": observable.n_samples,
         "context_length": observable.context_length,
         "sample_ids": [str(s) for s in observable.sample_ids],
@@ -382,6 +373,35 @@ def _save_traces_npz(
         "task_types": [str(s) if s is not None else None for s in observable.task_types],
     }
     save_json(os.path.join(chain_dir, "observable_meta.json"), meta)
+
+
+def _save_query_traces_npz(
+    chain_dir: str,
+    chain_id: int,
+    seq_losses: list[torch.Tensor],
+    token_losses: list[torch.Tensor],
+    observable: Observable,
+) -> None:
+    seq_arr = _stack_or_empty_seq(seq_losses, observable)
+    token_arr = _stack_or_empty_token(token_losses, observable)
+
+    np.savez_compressed(
+        os.path.join(chain_dir, "query_loss_trace.npz"),
+        seq_loss=seq_arr,
+        token_loss=token_arr,
+    )
+
+    meta = {
+        "chain_id": chain_id,
+        "num_draws": int(seq_arr.shape[0]),
+        "n_samples": observable.n_samples,
+        "context_length": observable.context_length,
+        "sample_ids": [str(s) for s in observable.sample_ids],
+        "source_types": [str(s) if s is not None else None for s in observable.source_types],
+        "subtypes": [str(s) if s is not None else None for s in observable.subtypes],
+        "task_types": [str(s) if s is not None else None for s in observable.task_types],
+    }
+    save_json(os.path.join(chain_dir, "query_meta.json"), meta)
 
 
 def _save_traces_legacy_jsonl(
@@ -413,42 +433,36 @@ def _save_traces_legacy_jsonl(
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _read_chain_loss_traces(
-    out_dir: str, chain_ids: list[int]
-) -> tuple[dict[int, list[float]], dict[int, list[float]], int]:
-    all_pool: dict[int, list[float]] = {}
-    all_query: dict[int, list[float]] = {}
-    max_total_draws = 0
+def _finite_or_none(x: Any) -> float | None:
+    try:
+        v = float(x)
+    except Exception:
+        return None
+    return v if np.isfinite(v) else None
+
+
+def _read_chain_step_loss_traces(
+    out_dir: str,
+    chain_ids: list[int],
+) -> tuple[dict[int, list[float]], int]:
+    """Read true per-step sampler losses from step_loss_trace.npz."""
+    all_step_loss: dict[int, list[float]] = {}
+    max_steps = 0
 
     for cid in chain_ids:
         chain_dir = os.path.join(out_dir, f"chain_{cid:03d}")
-
-        npz_path = os.path.join(chain_dir, "observable_loss_trace.npz")
-        if not os.path.isfile(npz_path):
+        path = os.path.join(chain_dir, "step_loss_trace.npz")
+        if not os.path.isfile(path):
             continue
-        data = np.load(npz_path)
-        post_pool = data["seq_loss"].mean(axis=1).tolist()
 
-        burnin_pool: list[float] = []
-        burnin_query: list[float] = []
-        burnin_npz = os.path.join(chain_dir, "burnin_loss_trace.npz")
-        if os.path.isfile(burnin_npz):
-            bdata = np.load(burnin_npz)
-            burnin_pool = bdata["pool_loss_mean"].tolist()
-            burnin_query = bdata["query_loss_mean"].tolist()
+        data = np.load(path)
+        losses = [_finite_or_none(x) for x in data["loss"].tolist()]
+        losses = [x for x in losses if x is not None]
 
-        all_pool[cid] = burnin_pool + post_pool
-        all_query[cid] = burnin_query
+        all_step_loss[cid] = losses
+        max_steps = max(max_steps, len(losses))
 
-        query_npz = os.path.join(chain_dir, "query_loss_trace.npz")
-        if os.path.isfile(query_npz):
-            qdata = np.load(query_npz)
-            post_query = qdata["seq_loss"].mean(axis=1).tolist()
-            all_query[cid] = burnin_query + post_query
-
-        max_total_draws = max(max_total_draws, len(all_pool[cid]))
-
-    return all_pool, all_query, max_total_draws
+    return all_step_loss, max_steps
 
 
 def _log_all_chains_overlay(
@@ -456,56 +470,48 @@ def _log_all_chains_overlay(
     chain_ids: list[int],
     num_burnin_draws: int,
 ) -> None:
-    """Log multi-chain overlay as Line charts with per-chain colors (includes burnin).
+    """Log multi-chain overlay of true per-step SGLD training losses.
 
-    Reads saved .npz traces (post-burnin) and burnin_loss_trace.npz, then
-    reconstructs the full draw-by-draw series.  Uses log_line() so all chains
-    appear on the same chart with distinct colours.
+    num_burnin_draws is kept for backward-compatible call sites.
     """
-    all_pool, all_query, max_total_draws = _read_chain_loss_traces(
-        out_dir, chain_ids
-    )
+    del num_burnin_draws
 
-    if len(all_pool) < 2:
+    all_step_loss, max_steps = _read_chain_step_loss_traces(out_dir, chain_ids)
+    if len(all_step_loss) < 1 or max_steps == 0:
         return
 
-    xaxis = [str(i) for i in range(max_total_draws)]
+    xaxis = [str(i) for i in range(max_steps)]
+    series: dict[str, list] = {}
 
-    pool_series: dict[str, list] = {}
-    query_series: dict[str, list] = {}
     for cid in chain_ids:
-        pool_list = all_pool.get(cid)
-        if pool_list is not None:
-            padded = pool_list + [None] * (max_total_draws - len(pool_list))
-            pool_series[f"chain{cid}"] = padded
-        q_list = all_query.get(cid)
-        if q_list is not None:
-            padded = q_list + [None] * (max_total_draws - len(q_list))
-            query_series[f"chain{cid}"] = padded
+        vals = all_step_loss.get(cid)
+        if vals is None:
+            continue
+        series[f"chain{cid}"] = vals + [None] * (max_steps - len(vals))
 
-    log_line("4_1_bif_overlay/pool_loss", xaxis, pool_series, smooth=True)
-    log_line("4_1_bif_overlay/query_loss", xaxis, query_series, smooth=True)
+    if series:
+        log_line("4_1_bif_sweep/step_loss_overlay", xaxis, series, smooth=True)
 
 
 def _log_training_summary_charts(out_dir: str, chain_ids: list[int]) -> None:
-    """Log per-draw training metrics as overlay Line charts with per-chain colors.
+    """Log per-draw summary charts.
 
-    Reads draw_metrics.npz from each chain and creates one Line chart per metric
-    with all chains overlaid.
+    step_loss_mean is the averaged sampler loss since the previous boundary.
+    pool/query losses are draw-time observables; burn-in entries are NaN.
     """
     metrics_keys = [
-        ("pool_loss_mean", "4_1_bif_summary/pool_loss"),
-        ("query_loss_mean", "4_1_bif_summary/query_loss"),
-        ("grad_norm_mean", "4_1_bif_summary/grad_norm"),
-        ("scaled_grad_norm_mean", "4_1_bif_summary/scaled_grad"),
-        ("noise_norm_mean", "4_1_bif_summary/noise_norm"),
-        ("localization_norm_mean", "4_1_bif_summary/localization_norm"),
-        ("weight_decay_norm_mean", "4_1_bif_summary/weight_decay_norm"),
-        ("prior_norm_mean", "4_1_bif_summary/prior_norm"),
-        ("snr_mean", "4_1_bif_summary/snr"),
-        ("step_loss_mean", "4_1_bif_summary/step_loss"),
-        ("step_distance_mean", "4_1_bif_summary/step_distance"),
-        ("param_dist", "4_1_bif_summary/param_dist"),
+        ("step_loss_mean", "4_1_bif_sweep/step_loss_mean"),
+        ("grad_norm_mean", "4_1_bif_sweep/grad_norm"),
+        ("scaled_grad_norm_mean", "4_1_bif_sweep/scaled_grad"),
+        ("noise_norm_mean", "4_1_bif_sweep/noise_norm"),
+        ("localization_norm_mean", "4_1_bif_sweep/localization_norm"),
+        ("weight_decay_norm_mean", "4_1_bif_sweep/weight_decay_norm"),
+        ("prior_norm_mean", "4_1_bif_sweep/prior_norm"),
+        ("snr_mean", "4_1_bif_sweep/snr"),
+        ("step_distance_mean", "4_1_bif_sweep/step_distance"),
+        ("param_dist", "4_1_bif_sweep/param_dist"),
+        ("pool_loss_mean", "4_1_bif_observable_draw/pool_loss"),
+        ("query_loss_mean", "4_1_bif_observable_draw/query_loss"),
     ]
 
     per_metric: dict[str, dict[str, list]] = {k: {} for _, k in metrics_keys}
@@ -515,13 +521,19 @@ def _log_training_summary_charts(out_dir: str, chain_ids: list[int]) -> None:
         npz_path = os.path.join(out_dir, f"chain_{cid:03d}", "draw_metrics.npz")
         if not os.path.isfile(npz_path):
             continue
+
         data = np.load(npz_path)
-        n = len(data["pool_loss_mean"])
+        if "step_loss_mean" not in data:
+            continue
+
+        n = len(data["step_loss_mean"])
         max_draws = max(max_draws, n)
-        for arr_key, _ in metrics_keys:
+
+        for arr_key, chart_key in metrics_keys:
             if arr_key not in data:
                 continue
-            per_metric[_][f"chain{cid}"] = data[arr_key].tolist()
+            vals = [_finite_or_none(v) for v in data[arr_key].tolist()]
+            per_metric[chart_key][f"chain{cid}"] = vals
 
     if max_draws == 0:
         return
@@ -532,10 +544,19 @@ def _log_training_summary_charts(out_dir: str, chain_ids: list[int]) -> None:
         series = per_metric[chart_key]
         if not series:
             continue
-        for cid_str in series:
+        for cid_str in list(series):
             vals = series[cid_str]
             series[cid_str] = vals + [None] * (max_draws - len(vals))
         log_line(chart_key, xaxis, series, smooth=True)
+
+
+def _param_distance_from_anchor(sampler: Any, anchor_params: dict[str, torch.Tensor]) -> float:
+    with torch.no_grad():
+        param_dist_sq = sum(
+            (p.data - anchor_params[n]).float().norm().item() ** 2
+            for n, p in sampler.params
+        )
+    return float(param_dist_sq ** 0.5)
 
 
 def run_bif(
@@ -585,9 +606,14 @@ def run_bif(
     ckpt_name = os.path.basename(model_name_or_path)
     tag = resolve_model_tag(model_tag, model_name_or_path)
     auto_exp_name = make_bif_name(
-        tag, ckpt_name, sgld_cfg.lr, sgld_cfg.gamma,
-        sgld_cfg.draws_per_chain, sgld_cfg.num_burnin_steps,
+        tag,
+        ckpt_name,
+        sgld_cfg.lr,
+        sgld_cfg.gamma,
+        sgld_cfg.draws_per_chain,
+        sgld_cfg.num_burnin_steps,
     )
+
     if manage_tracking and rank == 0:
         init_run(
             experiment_name=experiment_name or auto_exp_name,
@@ -599,6 +625,11 @@ def run_bif(
                 "max_length": max_length,
                 "chain_id": chain_id,
                 "model_tag": tag,
+                "loss_semantics": {
+                    "sweep_loss": "per-step mini-batch training loss used by SGLD",
+                    "observable_loss": "pool/query loss computed only on post-burn-in draws",
+                    "burnin_observable_loss": "not computed",
+                },
             },
             tags=["bif", ckpt_name, tag],
         )
@@ -606,6 +637,7 @@ def run_bif(
     if device is None:
         device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
+
     ensure_dir(out_dir)
 
     logger.info("Loading tokenizer and model (rank=%d)", rank)
@@ -619,6 +651,7 @@ def run_bif(
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }[dtype]
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         torch_dtype=pt_dtype if device.type == "cuda" else torch.float32,
@@ -673,6 +706,12 @@ def run_bif(
                 "sampling_effective_batch_size": sampling_effective_batch_size,
                 "observable_sample_budget": observable_budget,
                 "sgld_config": asdict(sgld_cfg),
+                "loss_semantics": {
+                    "step_loss_trace.npz": "true sampler step loss",
+                    "observable_loss_trace.npz": "post-burn-in pool draw losses",
+                    "query_loss_trace.npz": "post-burn-in query draw losses",
+                    "burnin_loss_trace.npz": "not produced by this runner",
+                },
             },
         )
 
@@ -699,6 +738,7 @@ def run_bif(
         eval_batch_size,
         sgld_cfg.batches_per_draw,
     )
+
     pool_obs = Observable(
         name="pool",
         dataset=pool_ds,
@@ -720,6 +760,7 @@ def run_bif(
         assigned_chains = [chain_id]
     else:
         assigned_chains = list(range(rank, sgld_cfg.num_chains, world_size))
+
     if not assigned_chains:
         logger.info("No chains assigned to rank %d", rank)
         if not single_chain_mode:
@@ -727,7 +768,7 @@ def run_bif(
                 f"{out_dir}/manifest_rank{rank:03d}.json",
                 {"rank": rank, "assigned_chains": []},
             )
-            _barrier()
+        _barrier()
         return
 
     for chain_id in assigned_chains:
@@ -736,13 +777,13 @@ def run_bif(
 
         dataloader_rng = torch.Generator(device="cpu")
         dataloader_rng.manual_seed(sgld_cfg.seed + chain_id)
+
         noise_gen = None
         if device.type == "cuda":
             noise_gen = torch.Generator(device=device)
             noise_gen.manual_seed(sgld_cfg.seed + chain_id)
 
         from itertools import cycle as _cycle
-
         from torch.utils.data import DataLoader as _DataLoader
 
         from bif.data.dataset import collate_bif_batch as _collate
@@ -765,11 +806,19 @@ def run_bif(
         query_seq_losses: list[torch.Tensor] = []
         query_token_losses: list[torch.Tensor] = []
 
-        burnin_pool_means: list[float] = []
-        burnin_query_means: list[float] = []
+        step_indices: list[int] = []
+        step_losses: list[float] = []
+        step_is_burnin: list[int] = []
 
-        total_steps = sgld_cfg.num_burnin_steps + sgld_cfg.draws_per_chain * sgld_cfg.num_steps_bw_draws
-        num_burnin_draws = sgld_cfg.num_burnin_steps // sgld_cfg.num_steps_bw_draws
+        total_steps = (
+            sgld_cfg.num_burnin_steps
+            + sgld_cfg.draws_per_chain * sgld_cfg.num_steps_bw_draws
+        )
+        num_burnin_draws = sgld_cfg.num_burnin_steps // max(
+            1,
+            sgld_cfg.num_steps_bw_draws,
+        )
+
         draw_count = 0
         burnin_draw_count = 0
         grad_accum = sgld_cfg.gradient_accumulation_steps
@@ -802,15 +851,17 @@ def run_bif(
         def _sgld_draw_summary(chain_id: int, step: int) -> dict[str, float]:
             if not draw_grad_norms:
                 return {}
-            gn = np.array(draw_grad_norms)
-            sgn = np.array(draw_scaled_grad_norms)
-            nn = np.array(draw_noise_norms)
-            ln = np.array(draw_localization_norms)
-            wd = np.array(draw_weight_decay_norms)
-            pn = np.array(draw_prior_norms)
-            dn = np.array(draw_step_distances)
-            sl = np.array(draw_step_losses)
-            sr = np.array(draw_snrs)
+
+            gn = np.array(draw_grad_norms, dtype=np.float64)
+            sgn = np.array(draw_scaled_grad_norms, dtype=np.float64)
+            nn = np.array(draw_noise_norms, dtype=np.float64)
+            ln = np.array(draw_localization_norms, dtype=np.float64)
+            wd = np.array(draw_weight_decay_norms, dtype=np.float64)
+            pn = np.array(draw_prior_norms, dtype=np.float64)
+            dn = np.array(draw_step_distances, dtype=np.float64)
+            sl = np.array(draw_step_losses, dtype=np.float64)
+            sr = np.array(draw_snrs, dtype=np.float64)
+
             return {
                 f"4_1_bif_sgld/chain{chain_id}/draw/grad_norm_mean": float(gn.mean()),
                 f"4_1_bif_sgld/chain{chain_id}/draw/grad_norm_max": float(gn.max()),
@@ -824,13 +875,23 @@ def run_bif(
                 f"4_1_bif_sgld/chain{chain_id}/draw/step_loss_mean": float(sl.mean()),
                 f"4_1_bif_sgld/chain{chain_id}/draw/snr_mean": float(sr.mean()),
                 f"4_1_bif_sgld/chain{chain_id}/draw/snr_min": float(sr.min()),
-                f"4_1_bif_sgld/chain{chain_id}/draw/num_steps": len(draw_grad_norms),
-                f"4_1_bif_sgld/chain{chain_id}/draw/actual_sgld_step": step,
+                f"4_1_bif_sgld/chain{chain_id}/draw/num_steps": float(len(draw_grad_norms)),
+                f"4_1_bif_sgld/chain{chain_id}/draw/actual_sgld_step": float(step),
             }
 
-        def _append_draw_aggregates(param_dist: float, is_burnin_draw: int) -> None:
-            all_draw_pool_means.append(float(pool_seq.mean()))
-            all_draw_query_means.append(float(query_seq.mean()))
+        def _append_draw_aggregates(
+            param_dist: float,
+            is_burnin_draw: int,
+            pool_loss_mean: float | None = None,
+            query_loss_mean: float | None = None,
+        ) -> None:
+            all_draw_pool_means.append(
+                float(pool_loss_mean) if pool_loss_mean is not None else float("nan")
+            )
+            all_draw_query_means.append(
+                float(query_loss_mean) if query_loss_mean is not None else float("nan")
+            )
+
             if draw_grad_norms:
                 all_draw_grad_norm.append(float(np.mean(draw_grad_norms)))
                 all_draw_scaled_grad_norm.append(float(np.mean(draw_scaled_grad_norms)))
@@ -842,17 +903,18 @@ def run_bif(
                 all_draw_step_distance.append(float(np.mean(draw_step_distances)))
                 all_draw_snr.append(float(np.mean(draw_snrs)))
             else:
-                all_draw_grad_norm.append(0.0)
-                all_draw_scaled_grad_norm.append(0.0)
-                all_draw_noise_norm.append(0.0)
-                all_draw_localization_norm.append(0.0)
-                all_draw_weight_decay_norm.append(0.0)
-                all_draw_prior_norm.append(0.0)
-                all_draw_step_loss.append(0.0)
-                all_draw_step_distance.append(0.0)
-                all_draw_snr.append(0.0)
-            all_draw_param_dist.append(param_dist)
-            all_draw_is_burnin.append(is_burnin_draw)
+                all_draw_grad_norm.append(float("nan"))
+                all_draw_scaled_grad_norm.append(float("nan"))
+                all_draw_noise_norm.append(float("nan"))
+                all_draw_localization_norm.append(float("nan"))
+                all_draw_weight_decay_norm.append(float("nan"))
+                all_draw_prior_norm.append(float("nan"))
+                all_draw_step_loss.append(float("nan"))
+                all_draw_step_distance.append(float("nan"))
+                all_draw_snr.append(float("nan"))
+
+            all_draw_param_dist.append(float(param_dist))
+            all_draw_is_burnin.append(int(is_burnin_draw))
 
         def _clear_draw_buffers() -> None:
             draw_grad_norms.clear()
@@ -866,12 +928,17 @@ def run_bif(
             draw_snrs.clear()
 
         pbar = tqdm(range(total_steps), desc=f"Chain {chain_id}", disable=(rank != 0))
+
         for step in pbar:
             is_burnin = step < sgld_cfg.num_burnin_steps
 
             if grad_accum > 1:
                 step_info = sampler.step_accumulated_dataloader(
-                    pool_ds, feed, grad_accum, device, step_generator=noise_gen,
+                    pool_ds,
+                    feed,
+                    grad_accum,
+                    device,
+                    step_generator=noise_gen,
                 )
             else:
                 batch = move_batch_to_device(next(feed), device)
@@ -879,18 +946,50 @@ def run_bif(
 
             steps_since_draw += 1
 
-            draw_grad_norms.append(float(step_info["grad_norm"]))
-            draw_scaled_grad_norms.append(float(step_info["scaled_grad_norm"]))
-            draw_noise_norms.append(float(step_info["noise_norm"]))
-            draw_localization_norms.append(float(step_info["localization_norm"]))
-            draw_weight_decay_norms.append(float(step_info["weight_decay_norm"]))
-            draw_prior_norms.append(float(step_info["prior_norm"]))
-            draw_step_distances.append(float(step_info["distance"]))
-            draw_step_losses.append(float(step_info["loss"]))
-            draw_snrs.append(
-                float(step_info["scaled_grad_norm"])
-                / (float(step_info["noise_norm"]) + 1e-12)
-            )
+            step_loss = float(step_info["loss"])
+            grad_norm = float(step_info["grad_norm"])
+            scaled_grad_norm = float(step_info["scaled_grad_norm"])
+            noise_norm = float(step_info["noise_norm"])
+            localization_norm = float(step_info["localization_norm"])
+            weight_decay_norm = float(step_info["weight_decay_norm"])
+            prior_norm = float(step_info["prior_norm"])
+            step_distance = float(step_info["distance"])
+            snr = scaled_grad_norm / (noise_norm + 1e-12)
+
+            draw_grad_norms.append(grad_norm)
+            draw_scaled_grad_norms.append(scaled_grad_norm)
+            draw_noise_norms.append(noise_norm)
+            draw_localization_norms.append(localization_norm)
+            draw_weight_decay_norms.append(weight_decay_norm)
+            draw_prior_norms.append(prior_norm)
+            draw_step_distances.append(step_distance)
+            draw_step_losses.append(step_loss)
+            draw_snrs.append(snr)
+
+            step_indices.append(int(step))
+            step_losses.append(step_loss)
+            step_is_burnin.append(1 if is_burnin else 0)
+
+            if rank == 0:
+                swan_log(
+                    {
+                        f"4_1_bif_sweep/chain{chain_id}/step_loss": step_loss,
+                        f"4_1_bif_sgld_step/chain{chain_id}/grad_norm": grad_norm,
+                        f"4_1_bif_sgld_step/chain{chain_id}/scaled_grad_norm": scaled_grad_norm,
+                        f"4_1_bif_sgld_step/chain{chain_id}/unscaled_grad_norm": float(step_info["unscaled_grad_norm"]),
+                        f"4_1_bif_sgld_step/chain{chain_id}/noise_norm": noise_norm,
+                        f"4_1_bif_sgld_step/chain{chain_id}/localization_norm": localization_norm,
+                        f"4_1_bif_sgld_step/chain{chain_id}/weight_decay_norm": weight_decay_norm,
+                        f"4_1_bif_sgld_step/chain{chain_id}/prior_norm": prior_norm,
+                        f"4_1_bif_sgld_step/chain{chain_id}/distance": step_distance,
+                        f"4_1_bif_sgld_step/chain{chain_id}/dot_grad_prior": float(step_info.get("dot_grad_prior", float("nan"))),
+                        f"4_1_bif_sgld_step/chain{chain_id}/dot_grad_noise": float(step_info.get("dot_grad_noise", float("nan"))),
+                        f"4_1_bif_sgld_step/chain{chain_id}/dot_prior_noise": float(step_info.get("dot_prior_noise", float("nan"))),
+                        f"4_1_bif_sgld_step/chain{chain_id}/signal_noise_ratio": snr,
+                        f"4_1_bif_sgld_step/chain{chain_id}/is_burnin": 1 if is_burnin else 0,
+                    },
+                    step=int(step),
+                )
 
             is_draw_step = (
                 not is_burnin
@@ -903,35 +1002,29 @@ def run_bif(
 
             if is_burnin_draw_step:
                 steps_since_draw = 0
-                model.eval()
-                pool_seq, pool_tok = pool_obs.compute_loss(model)
-                query_seq, query_tok = query_obs.compute_loss(model)
-
-                if torch.isnan(pool_seq).any() or torch.isnan(query_seq).any():
-                    logger.warning(
-                        "NaN detected at burn-in draw %d (step %d, chain %d). "
-                        "SGLD diverged — stopping this chain early.",
-                        burnin_draw_count, step, chain_id if single_chain_mode else rank,
-                    )
-                    break
+                param_dist = _param_distance_from_anchor(sampler, anchor_params)
 
                 if rank == 0:
-                    obs_data = {
-                        f"4_1_bif_loss/chain{chain_id}/pool_loss_mean": float(pool_seq.mean()),
-                        f"4_1_bif_loss/chain{chain_id}/query_loss_mean": float(query_seq.mean()),
-                        f"4_1_bif_loss/chain{chain_id}/is_burnin": 1,
+                    burnin_data = {
+                        f"4_1_bif_sweep/chain{chain_id}/burnin_boundary": 1,
+                        f"4_1_bif_sweep/chain{chain_id}/step_loss_mean_since_last_boundary": (
+                            float(np.mean(draw_step_losses))
+                            if draw_step_losses
+                            else float("nan")
+                        ),
                     }
-                    obs_data.update(_sgld_draw_summary(chain_id, step))
-                    swan_log(obs_data, step=burnin_draw_count)
-                burnin_pool_means.append(float(pool_seq.mean()))
-                burnin_query_means.append(float(query_seq.mean()))
-                burnin_draw_count += 1
+                    burnin_data.update(_sgld_draw_summary(chain_id, step))
+                    swan_log(burnin_data, step=int(step))
 
+                burnin_draw_count += 1
                 _append_draw_aggregates(
-                    param_dist=float(step_info["distance"]),
+                    param_dist=param_dist,
                     is_burnin_draw=1,
+                    pool_loss_mean=None,
+                    query_loss_mean=None,
                 )
                 _clear_draw_buffers()
+                continue
 
             if is_draw_step:
                 steps_since_draw = 0
@@ -942,8 +1035,10 @@ def run_bif(
                 if torch.isnan(pool_seq).any() or torch.isnan(query_seq).any():
                     logger.warning(
                         "NaN detected at draw %d (step %d, chain %d). "
-                        "SGLD diverged — stopping this chain early.",
-                        draw_count, step, chain_id if single_chain_mode else rank,
+                        "SGLD diverged; stopping this chain early.",
+                        draw_count,
+                        step,
+                        chain_id if single_chain_mode else rank,
                     )
                     break
 
@@ -951,116 +1046,98 @@ def run_bif(
                 pool_token_losses.append(pool_tok)
                 query_seq_losses.append(query_seq)
                 query_token_losses.append(query_tok)
-
                 draw_count += 1
+
                 pbar.set_postfix(
+                    step_loss=f"{step_loss:.4f}",
                     pool_mean=f"{pool_seq.mean():.4f}",
                     query_mean=f"{query_seq.mean():.4f}",
                     draw=draw_count,
                 )
 
+                param_dist = _param_distance_from_anchor(sampler, anchor_params)
+                pool_mean = float(pool_seq.mean())
+                query_mean = float(query_seq.mean())
+
                 if rank == 0:
                     draw_idx = num_burnin_draws + draw_count - 1
-                    with torch.no_grad():
-                        param_dist_sq = sum(
-                            (p.data - anchor_params[n]).float().norm().item() ** 2
-                            for n, p in sampler.params
-                        )
-                        param_dist = param_dist_sq ** 0.5
                     obs_data = {
-                        f"4_1_bif_loss/chain{chain_id}/pool_loss_mean": float(pool_seq.mean()),
-                        f"4_1_bif_loss/chain{chain_id}/query_loss_mean": float(query_seq.mean()),
-                        f"4_1_bif_loss/chain{chain_id}/param_dist_from_anchor": param_dist,
-                        f"4_1_bif_loss/chain{chain_id}/is_burnin": 0,
+                        f"4_1_bif_observable_draw/chain{chain_id}/pool_loss_mean": pool_mean,
+                        f"4_1_bif_observable_draw/chain{chain_id}/query_loss_mean": query_mean,
+                        f"4_1_bif_observable_draw/chain{chain_id}/param_dist_from_anchor": param_dist,
+                        f"4_1_bif_observable_draw/chain{chain_id}/is_burnin": 0,
                     }
                     obs_data.update(_sgld_draw_summary(chain_id, step))
                     swan_log(obs_data, step=draw_idx)
-                else:
-                    with torch.no_grad():
-                        param_dist_sq = sum(
-                            (p.data - anchor_params[n]).float().norm().item() ** 2
-                            for n, p in sampler.params
-                        )
-                        param_dist = param_dist_sq ** 0.5
 
-                _append_draw_aggregates(param_dist=param_dist, is_burnin_draw=0)
+                _append_draw_aggregates(
+                    param_dist=param_dist,
+                    is_burnin_draw=0,
+                    pool_loss_mean=pool_mean,
+                    query_loss_mean=query_mean,
+                )
                 _clear_draw_buffers()
 
-            if rank == 0:
-                swan_log(
-                    {
-                        f"4_1_bif_sgld_step/chain{chain_id}/loss": step_info["loss"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/grad_norm": step_info["grad_norm"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/scaled_grad_norm": step_info["scaled_grad_norm"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/unscaled_grad_norm": step_info["unscaled_grad_norm"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/noise_norm": step_info["noise_norm"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/localization_norm": step_info["localization_norm"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/weight_decay_norm": step_info["weight_decay_norm"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/prior_norm": step_info["prior_norm"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/distance": step_info["distance"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/dot_grad_prior": step_info["dot_grad_prior"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/dot_grad_noise": step_info["dot_grad_noise"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/dot_prior_noise": step_info["dot_prior_noise"],
-                        f"4_1_bif_sgld_step/chain{chain_id}/signal_noise_ratio": step_info["scaled_grad_norm"] / (step_info["noise_norm"] + 1e-12),
-                    },
-                    step=step,
-                )
+        np.savez_compressed(
+            os.path.join(chain_dir, "step_loss_trace.npz"),
+            step=np.asarray(step_indices, dtype=np.int64),
+            loss=np.asarray(step_losses, dtype=np.float64),
+            is_burnin=np.asarray(step_is_burnin, dtype=np.int64),
+        )
 
-        _save_traces_npz(chain_dir, chain_id, pool_seq_losses, pool_token_losses, pool_obs)
+        _save_traces_npz(
+            chain_dir,
+            chain_id,
+            pool_seq_losses,
+            pool_token_losses,
+            pool_obs,
+        )
 
-        if burnin_pool_means:
-            np.savez_compressed(
-                os.path.join(chain_dir, "burnin_loss_trace.npz"),
-                pool_loss_mean=np.array(burnin_pool_means),
-                query_loss_mean=np.array(burnin_query_means),
-            )
-
-        if all_draw_pool_means:
+        if all_draw_step_loss:
             np.savez_compressed(
                 os.path.join(chain_dir, "draw_metrics.npz"),
-                pool_loss_mean=np.array(all_draw_pool_means),
-                query_loss_mean=np.array(all_draw_query_means),
-                grad_norm_mean=np.array(all_draw_grad_norm),
-                scaled_grad_norm_mean=np.array(all_draw_scaled_grad_norm),
-                noise_norm_mean=np.array(all_draw_noise_norm),
-                localization_norm_mean=np.array(all_draw_localization_norm),
-                weight_decay_norm_mean=np.array(all_draw_weight_decay_norm),
-                prior_norm_mean=np.array(all_draw_prior_norm),
-                step_loss_mean=np.array(all_draw_step_loss),
-                step_distance_mean=np.array(all_draw_step_distance),
-                snr_mean=np.array(all_draw_snr),
-                param_dist=np.array(all_draw_param_dist),
-                is_burnin=np.array(all_draw_is_burnin),
+                pool_loss_mean=np.asarray(all_draw_pool_means, dtype=np.float64),
+                query_loss_mean=np.asarray(all_draw_query_means, dtype=np.float64),
+                grad_norm_mean=np.asarray(all_draw_grad_norm, dtype=np.float64),
+                scaled_grad_norm_mean=np.asarray(all_draw_scaled_grad_norm, dtype=np.float64),
+                noise_norm_mean=np.asarray(all_draw_noise_norm, dtype=np.float64),
+                localization_norm_mean=np.asarray(all_draw_localization_norm, dtype=np.float64),
+                weight_decay_norm_mean=np.asarray(all_draw_weight_decay_norm, dtype=np.float64),
+                prior_norm_mean=np.asarray(all_draw_prior_norm, dtype=np.float64),
+                step_loss_mean=np.asarray(all_draw_step_loss, dtype=np.float64),
+                step_distance_mean=np.asarray(all_draw_step_distance, dtype=np.float64),
+                snr_mean=np.asarray(all_draw_snr, dtype=np.float64),
+                param_dist=np.asarray(all_draw_param_dist, dtype=np.float64),
+                is_burnin=np.asarray(all_draw_is_burnin, dtype=np.int64),
             )
 
-        query_meta = {
-            "chain_id": chain_id,
-            "num_draws": len(query_seq_losses),
-            "n_samples": query_obs.n_samples,
-            "context_length": query_obs.context_length,
-            "sample_ids": [str(s) for s in query_obs.sample_ids],
-            "source_types": [str(s) if s is not None else None for s in query_obs.source_types],
-            "subtypes": [str(s) if s is not None else None for s in query_obs.subtypes],
-            "task_types": [str(s) if s is not None else None for s in query_obs.task_types],
-        }
-        query_seq_arr = torch.stack(query_seq_losses, dim=0).float().numpy()
-        query_token_arr = torch.stack(query_token_losses, dim=0).float().numpy()
-        np.savez_compressed(
-            os.path.join(chain_dir, "query_loss_trace.npz"),
-            seq_loss=query_seq_arr,
-            token_loss=query_token_arr,
+        _save_query_traces_npz(
+            chain_dir,
+            chain_id,
+            query_seq_losses,
+            query_token_losses,
+            query_obs,
         )
-        save_json(os.path.join(chain_dir, "query_meta.json"), query_meta)
 
         _save_traces_legacy_jsonl(
-            chain_dir, chain_id, pool_seq_losses,
-            pool_obs.source_types, pool_obs.subtypes, pool_obs.task_types,
-            pool_obs.sample_ids, "pool",
+            chain_dir,
+            chain_id,
+            pool_seq_losses,
+            pool_obs.source_types,
+            pool_obs.subtypes,
+            pool_obs.task_types,
+            pool_obs.sample_ids,
+            "pool",
         )
         _save_traces_legacy_jsonl(
-            chain_dir, chain_id, query_seq_losses,
-            query_obs.source_types, query_obs.subtypes, query_obs.task_types,
-            query_obs.sample_ids, "query",
+            chain_dir,
+            chain_id,
+            query_seq_losses,
+            query_obs.source_types,
+            query_obs.subtypes,
+            query_obs.task_types,
+            query_obs.sample_ids,
+            "query",
         )
 
         save_json(
@@ -1068,7 +1145,14 @@ def run_bif(
             {
                 "chain_id": chain_id,
                 "draws_written": draw_count,
+                "burnin_boundaries_written": burnin_draw_count,
                 "sgld_config": asdict(sgld_cfg),
+                "loss_semantics": {
+                    "step_loss_trace": "true sampler step loss",
+                    "observable_loss_trace": "post-burn-in pool draw losses only",
+                    "query_loss_trace": "post-burn-in query draw losses only",
+                    "burnin_observable_loss": "not computed",
+                },
             },
         )
 
@@ -1082,12 +1166,17 @@ def run_bif(
             f"{out_dir}/manifest_rank{rank:03d}.json",
             {"rank": rank, "assigned_chains": assigned_chains},
         )
+
     logger.info("All chains completed on rank %d", rank)
+
     if not single_chain_mode:
         _barrier()
 
     if rank == 0 and len(assigned_chains) > 1:
-        num_burnin_draws = sgld_cfg.num_burnin_steps // max(1, sgld_cfg.num_steps_bw_draws)
+        num_burnin_draws = sgld_cfg.num_burnin_steps // max(
+            1,
+            sgld_cfg.num_steps_bw_draws,
+        )
         _log_all_chains_overlay(out_dir, assigned_chains, num_burnin_draws)
         _log_training_summary_charts(out_dir, assigned_chains)
 
@@ -1130,7 +1219,12 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--gamma", type=float, default=1e-3)
     parser.add_argument("--beta", type=float, default=1.0)
-    parser.add_argument("--nbeta_mode", type=str, default="devinterp", choices=["devinterp", "dataset"])
+    parser.add_argument(
+        "--nbeta_mode",
+        type=str,
+        default="devinterp",
+        choices=["devinterp", "dataset"],
+    )
     parser.add_argument("--nbeta", type=float, default=0.0)
     parser.add_argument("--noise_level", type=float, default=1.0)
     parser.add_argument("--num_chains", type=int, default=4)
@@ -1149,18 +1243,17 @@ def main() -> None:
     parser.add_argument("--rmsprop_eps", type=float, default=1e-1)
     parser.add_argument("--batches_per_draw", type=int, default=0)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument(
-        "--chain_id",
-        type=int,
-        default=None,
-    )
+    parser.add_argument("--chain_id", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument(
-        "--dtype", default="float32", choices=["float32", "float16", "bfloat16"]
+        "--dtype",
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
     )
     parser.add_argument("--experiment_name", default=None)
     parser.add_argument("--model_tag", default=None)
     parser.add_argument("--run_name", default=None)
+
     args = parser.parse_args()
 
     if args.run_all_checkpoints and not args.model_root:
@@ -1170,6 +1263,7 @@ def main() -> None:
 
     rank, world_size, _ = _get_distributed_context()
     single_chain_mode = args.chain_id is not None
+
     if not single_chain_mode and world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
@@ -1200,6 +1294,7 @@ def main() -> None:
             ckpt_filter = None
             if args.checkpoints:
                 ckpt_filter = [c.strip() for c in args.checkpoints.split(",") if c.strip()]
+
             if single_chain_mode:
                 plan = _discover_checkpoint_plan(
                     args.model_root,
@@ -1224,6 +1319,7 @@ def main() -> None:
                 else:
                     plan = []
                 plan = _broadcast_plan(plan, rank, world_size)
+
             if not plan:
                 logger.info("Nothing left to run.")
                 return
@@ -1238,14 +1334,18 @@ def main() -> None:
                 elif args.base_model_path and os.path.isdir(args.base_model_path):
                     tokenizer_path = args.base_model_path
 
-            draws_per_ckpt = cfg.num_chains * cfg.draws_per_chain
             if args.experiment_name:
                 run_label = args.experiment_name
             else:
                 tag = resolve_model_tag(args.model_tag, args.model_root or "")
                 run_label = make_bif_pipeline_name(
-                    tag, cfg.lr, cfg.gamma, cfg.draws_per_chain, cfg.num_burnin_steps,
+                    tag,
+                    cfg.lr,
+                    cfg.gamma,
+                    cfg.draws_per_chain,
+                    cfg.num_burnin_steps,
                 )
+
             if rank == 0:
                 ckpt_names = [name for name, _ in plan]
                 init_run(
@@ -1256,10 +1356,15 @@ def main() -> None:
                         "resume": args.resume,
                         "sgld": asdict(cfg),
                         "max_length": args.max_length,
+                        "loss_semantics": {
+                            "sweep_loss": "per-step mini-batch training loss used by SGLD",
+                            "observable_loss": "post-burn-in draw loss only",
+                        },
                     },
                     tags=["bif", "pipeline"] + (["resume"] if args.resume else []),
                 )
-            for ckpt_idx, (ckpt_name, ckpt_path) in enumerate(plan):
+
+            for ckpt_name, ckpt_path in plan:
                 logger.info("Checkpoint: %s", ckpt_name)
                 run_bif(
                     model_name_or_path=ckpt_path,
@@ -1276,9 +1381,11 @@ def main() -> None:
                     dtype=args.dtype,
                     manage_tracking=False,
                     chain_id=args.chain_id,
+                    model_tag=args.model_tag,
                 )
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
             if rank == 0:
                 swan_finish()
         else:

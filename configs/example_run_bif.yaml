@@ -1,24 +1,24 @@
-model_name_or_path: /path/to/model-or-checkpoint
-tokenizer_path: /path/to/tokenizer
-pool_jsonl: /path/to/pool.jsonl
-query_jsonl: /path/to/query.jsonl
+model_name_or_path: ./step2000
+tokenizer_path: ./step2000
+pool_jsonl: ./data/pool_800.jsonl
+query_jsonl: ./data/query_gsm8k_20.jsonl
 out_dir: ./runs/bif_traces
 
-num_chains: 4
-draws_per_chain: 60
-max_length: 256
-train_batch_size: 16
-eval_batch_size: 32
+num_chains: 2
+draws_per_chain: 300
+max_length: 512
+train_batch_size: 32
+eval_batch_size: 128
 pool_eval_subset: 0
 
 lr: 5e-6
 gamma: 1e-3
 beta: 1.0
 nbeta_mode: devinterp
-nbeta: -1.0
+nbeta: 10
 noise_level: 1.0
-num_burnin_steps: 0
-num_steps_bw_draws: 1
+num_burnin_steps: 100
+num_steps_bw_draws: 2
 seed: 42
 weight_decay: 0.0
 sampler_type: sgld
