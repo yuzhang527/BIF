@@ -5,8 +5,54 @@ import argparse
 import sys
 
 
+TORCHRUN_LOCAL_RANK_FLAGS = {"--local-rank", "--local_rank"}
+
+
+def _add_torchrun_compat_arg(parser: argparse.ArgumentParser) -> None:
+    """Accept torchrun-injected local rank arguments without exposing them in help."""
+
+    parser.add_argument(
+        "--local-rank",
+        "--local_rank",
+        dest="local_rank",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+
+
+def _strip_torchrun_args(argv: list[str]) -> list[str]:
+    """Remove torchrun's local-rank arguments before forwarding to nested parsers."""
+
+    out: list[str] = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in TORCHRUN_LOCAL_RANK_FLAGS:
+            skip_next = True
+            continue
+        if arg.startswith("--local-rank=") or arg.startswith("--local_rank="):
+            continue
+        out.append(arg)
+    return out
+
+
+def _argv_after_command(command: str) -> list[str]:
+    """Return argv after the subcommand, robust to torchrun args before/after it."""
+
+    argv = _strip_torchrun_args(sys.argv[1:])
+    try:
+        idx = argv.index(command)
+    except ValueError:
+        return []
+    return argv[idx + 1 :]
+
+
 def _add_run_bif_parser(sub: argparse._SubParsersAction) -> None:
     p_run = sub.add_parser("run-bif", help="Run BIF trace collection")
+    _add_torchrun_compat_arg(p_run)
     p_run.add_argument("--config", default=None, help="YAML config file")
     p_run.add_argument("--model_name_or_path", default=None)
     p_run.add_argument("--model_root", default=None)
@@ -50,6 +96,7 @@ def _add_run_bif_parser(sub: argparse._SubParsersAction) -> None:
 
 def _add_analyze_bif_parser(sub: argparse._SubParsersAction) -> None:
     p_analyze = sub.add_parser("analyze-bif", help="Analyze BIF results")
+    _add_torchrun_compat_arg(p_analyze)
     p_analyze.add_argument("--config", default=None, help="YAML config file")
     p_analyze.add_argument("--bif_root", default=None)
     p_analyze.add_argument("--out_dir", default=None)
@@ -82,6 +129,7 @@ def _add_analyze_bif_parser(sub: argparse._SubParsersAction) -> None:
 
 def _add_extract_parser(sub: argparse._SubParsersAction) -> None:
     p_extract = sub.add_parser("extract-top", help="Extract top-influence samples")
+    _add_torchrun_compat_arg(p_extract)
     p_extract.add_argument("--pool_jsonl", required=True)
     p_extract.add_argument("--ranking_csv", required=True)
     p_extract.add_argument("--out_dir", required=True)
@@ -100,6 +148,7 @@ def _add_extract_parser(sub: argparse._SubParsersAction) -> None:
 
 def _add_sweep_parser(sub: argparse._SubParsersAction) -> None:
     p_sweep = sub.add_parser("sweep-bif", help="Sweep BIF sampler parameters and run diagnostics")
+    _add_torchrun_compat_arg(p_sweep)
     p_sweep.add_argument("--config", required=True, help="YAML sweep config")
     p_sweep.add_argument("--out_dir", default=None, help="Override output_dir in config")
     p_sweep.add_argument("--dry_run", action="store_true", help="Write plan without launching run-bif")
@@ -110,6 +159,7 @@ def main() -> None:
         prog="bif",
         description="BIF-only toolkit: run-bif, analyze-bif, extract-top, sweep-bif",
     )
+    _add_torchrun_compat_arg(parser)
     sub = parser.add_subparsers(dest="command", help="Available commands")
     _add_run_bif_parser(sub)
     _add_analyze_bif_parser(sub)
@@ -124,7 +174,7 @@ def main() -> None:
     if args.command == "run-bif":
         from bif.analysis import bif_runner as runner
 
-        argv = sys.argv[2:]
+        argv = _argv_after_command("run-bif")
         saved_argv = sys.argv
         sys.argv = ["bif run-bif"] + argv
         try:
@@ -200,9 +250,10 @@ def main() -> None:
     if args.command == "sweep-bif":
         from bif.analysis.sweep_runner import main as sweep_main
 
-        sweep_main(sys.argv[2:])
+        sweep_main(_argv_after_command("sweep-bif"))
         return
 
 
 if __name__ == "__main__":
     main()
+

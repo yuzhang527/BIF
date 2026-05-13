@@ -1,6 +1,35 @@
 # Example grid sweep for BIF sampler diagnostics.
-# Launch with:
+#
+# This config is intended to be used with the patched torchrun-safe
+# sweep runner in src/bif/analysis/sweep_runner.py.
+#
+# Single-process sweep:
 #   python -m bif.cli sweep-bif --config configs/example_sweep_bif.yaml
+#
+# Multi-GPU sweep, one sweep worker per GPU:
+#   torchrun --standalone --nnodes=1 --nproc-per-node=4 \
+#     -m bif.cli sweep-bif --config configs/example_sweep_bif.yaml
+#
+# For an 8-GPU node, use:
+#   torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+#     -m bif.cli sweep-bif --config configs/example_sweep_bif.yaml
+#
+# If you run multiple torchrun sweep jobs on the same machine at the same time,
+# prefer an auto-selected rendezvous port:
+#   torchrun --rdzv-backend=c10d --rdzv-endpoint=localhost:0 \
+#     --nnodes=1 --nproc-per-node=4 \
+#     -m bif.cli sweep-bif --config configs/example_sweep_bif.yaml
+#
+# Torchrun-safe sweep semantics after the patch:
+#   - outer torchrun ranks split the sweep grid by idx % WORLD_SIZE == RANK;
+#   - child run-bif/analyze-bif processes do NOT inherit RANK/WORLD_SIZE/LOCAL_RANK;
+#   - each child is masked to one GPU through CUDA_VISIBLE_DEVICES;
+#   - each run directory gets a .sweep_claim file to prevent duplicate writers;
+#   - only rank 0 writes the final sweep_summary.csv.
+#
+# If a job is killed hard, a stale .sweep_claim file may remain in a run dir.
+# After confirming no process is still writing that run, delete the stale
+# .sweep_claim file and resume with skip_existing: true.
 
 base_run_config: example_run_bif.yaml
 output_dir: /root/BIF/runs/bif_sweeps/example_sweep
@@ -16,15 +45,16 @@ run_overrides:
 
 sweep:
   lr:
-    values: [1.0e-5]
+    values: [1.0e-4]
   gamma:
     values: [100, 1000]
   nbeta:
-    values: [10, 100]
+    values: [100]
 
 baseline:
   # Adds one nbeta=0 run for every lr x gamma pair unless nbeta=0 is already in the grid.
   run_nbeta_zero: false
+
   # Compare each nonzero-nbeta run with the matched nbeta=0 run at the same lr/gamma.
   compare_to_nbeta_zero: false
   include_if_in_grid: true
@@ -40,6 +70,7 @@ analysis:
 diagnostics:
   checkpoint: null
   reduce_chains: stack
+
   split_stability:
     enabled: true
     num_splits: 20
@@ -49,6 +80,7 @@ diagnostics:
     pass_threshold: 0.4
     seed: 42
     min_draws: 8
+
   chain_stability:
     enabled: true
     top_k: [150]
@@ -62,5 +94,14 @@ execution:
   skip_existing: true
   continue_on_error: true
   dry_run: false
-  # Useful when running under torchrun or a custom env.
+
+  # Extra environment variables passed to child run-bif/analyze-bif processes.
+  #
+  # Do not put distributed identity variables here. The patched sweep runner
+  # intentionally strips these from child processes:
+  #   RANK, WORLD_SIZE, LOCAL_RANK, LOCAL_WORLD_SIZE, MASTER_ADDR, MASTER_PORT,
+  #   TORCHELASTIC_RUN_ID, TORCHELASTIC_RESTART_COUNT, TORCHELASTIC_MAX_RESTARTS.
+  #
+  # For normal multi-GPU sweep usage, leave this empty. The runner will set
+  # CUDA_VISIBLE_DEVICES per rank automatically.
   extra_env: {}

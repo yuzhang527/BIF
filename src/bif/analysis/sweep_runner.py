@@ -3,11 +3,21 @@
 The runner builds a grid over lr, gamma, and nbeta, launches existing
 ``run-bif`` and ``analyze-bif`` commands for each grid point, then runs the
 new split/chain stability diagnostics from ``sweep_diagnostics``.
+
+This version is safe to launch with torchrun at the sweep level:
+
+    torchrun --standalone --nnodes=1 --nproc-per-node=N -m bif.cli sweep-bif --config ...
+
+In that mode, each outer torchrun rank owns a disjoint subset of sweep points.
+Child ``run-bif`` / ``analyze-bif`` processes intentionally do not inherit the
+outer torchrun distributed environment, and each child is masked to the GPU for
+its local rank by default.
 """
 from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import contextmanager
 import itertools
 import json
 import os
@@ -104,6 +114,23 @@ ANALYZE_VALUE_FLAGS = {
 ANALYZE_LIST_FLAGS = {"convergence_checkpoints"}
 ANALYZE_BOOL_FLAGS = {"enable_aux_query_plots", "negate_scores"}
 
+# Environment keys created by torchrun / torch elastic. These must not leak from
+# an outer sweep-level torchrun process into child run-bif/analyze-bif processes.
+DIST_ENV_KEYS = {
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "GROUP_RANK",
+    "ROLE_RANK",
+    "ROLE_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "TORCHELASTIC_RUN_ID",
+    "TORCHELASTIC_RESTART_COUNT",
+    "TORCHELASTIC_MAX_RESTARTS",
+}
+
 
 @dataclass(frozen=True)
 class SweepPoint:
@@ -143,6 +170,126 @@ class SweepConfig:
     diagnostics: dict[str, Any] = field(default_factory=dict)
     baseline: BaselineConfig = field(default_factory=BaselineConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _torchrun_context() -> tuple[int, int, int]:
+    """Return rank, world size, and local rank for an outer torchrun sweep."""
+
+    rank = _env_int("RANK", 0)
+    world_size = _env_int("WORLD_SIZE", 1)
+    local_rank = _env_int("LOCAL_RANK", 0)
+    return rank, world_size, local_rank
+
+
+def _init_sweep_dist_if_needed(world_size: int) -> bool:
+    """Initialize a small CPU process group for barriers between sweep workers."""
+
+    if world_size <= 1:
+        return False
+
+    import torch.distributed as dist
+
+    if dist.is_available() and not dist.is_initialized():
+        # We only need barriers for orchestration. Using gloo avoids consuming GPU
+        # NCCL resources in the sweep controller.
+        dist.init_process_group(backend=os.environ.get("BIF_SWEEP_DIST_BACKEND", "gloo"))
+        return True
+    return False
+
+
+def _barrier_if_needed(world_size: int) -> None:
+    if world_size <= 1:
+        return
+
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def _destroy_sweep_dist_if_started(started: bool) -> None:
+    if not started:
+        return
+
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _visible_device_for_local_rank(local_rank: int) -> str:
+    """Map torchrun LOCAL_RANK to one physical CUDA_VISIBLE_DEVICES entry."""
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        devices = [d.strip() for d in visible.split(",") if d.strip()]
+        if 0 <= local_rank < len(devices):
+            return devices[local_rank]
+    return str(local_rank)
+
+
+def _child_env_for_rank(extra_env: dict[str, str], local_rank: int, world_size: int) -> dict[str, str]:
+    """Build a clean child env for run-bif/analyze-bif.
+
+    The important behavior is that child processes must not inherit outer
+    torchrun variables. Otherwise run-bif would think it is part of the outer
+    sweep process group and would shard chains incorrectly or collide on shared
+    outputs.
+    """
+
+    env = os.environ.copy()
+
+    for key in DIST_ENV_KEYS:
+        env.pop(key, None)
+
+    env.update({str(k): str(v) for k, v in extra_env.items()})
+
+    # Do not allow execution.extra_env to accidentally reintroduce distributed
+    # identity. sweep-bif owns sharding; child commands are single-process jobs.
+    for key in DIST_ENV_KEYS:
+        env.pop(key, None)
+
+    # In torchrun sweep mode, bind each child to one GPU. Inside the child,
+    # cuda:0 maps to this selected physical device.
+    if world_size > 1 and os.environ.get("BIF_SWEEP_MASK_CHILD_GPU", "1") != "0":
+        env["CUDA_VISIBLE_DEVICES"] = _visible_device_for_local_rank(local_rank)
+
+    return env
+
+
+
+
+@contextmanager
+def _local_single_process_env(local_rank: int, world_size: int):
+    """Temporarily make in-process diagnostics look like a standalone rank-0 job.
+
+    sweep-bif itself may be running under outer torchrun. Diagnostics, however,
+    are executed inside the sweep worker process rather than as distributed
+    children. sweep_diagnostics gates chart logging on RANK == 0, so a sweep
+    point assigned to outer rank 1 would otherwise write CSV/JSON but no charts.
+    """
+
+    keys = set(DIST_ENV_KEYS) | {"CUDA_VISIBLE_DEVICES"}
+    saved = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in DIST_ENV_KEYS:
+            os.environ.pop(key, None)
+        if world_size > 1 and os.environ.get("BIF_SWEEP_MASK_CHILD_GPU", "1") != "0":
+            os.environ["CUDA_VISIBLE_DEVICES"] = _visible_device_for_local_rank(local_rank)
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _read_yaml(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -271,7 +418,12 @@ def _build_plan(raw_cfg: SweepConfig) -> list[SweepPoint]:
     return points
 
 
-def _payload_to_cli_args(payload: dict[str, Any], value_flags: set[str], bool_flags: set[str], list_flags: set[str] | None = None) -> list[str]:
+def _payload_to_cli_args(
+    payload: dict[str, Any],
+    value_flags: set[str],
+    bool_flags: set[str],
+    list_flags: set[str] | None = None,
+) -> list[str]:
     list_flags = list_flags or set()
     args: list[str] = []
     for key in sorted(value_flags):
@@ -293,7 +445,13 @@ def _payload_to_cli_args(payload: dict[str, Any], value_flags: set[str], bool_fl
     return args
 
 
-def _run_subprocess(cmd: list[str], cwd: str | None, env: dict[str, str], log_path: str, dry_run: bool = False) -> int:
+def _run_subprocess(
+    cmd: list[str],
+    cwd: str | None,
+    env: dict[str, str],
+    log_path: str,
+    dry_run: bool = False,
+) -> int:
     ensure_dir(str(Path(log_path).parent))
     printable = " ".join(cmd)
     with open(log_path, "a", encoding="utf-8") as log_f:
@@ -315,23 +473,80 @@ def _run_subprocess(cmd: list[str], cwd: str | None, env: dict[str, str], log_pa
         return int(proc.returncode)
 
 
-def _is_done(run_dir: str) -> bool:
+def _read_manifest(run_dir: str) -> dict[str, Any] | None:
     manifest = os.path.join(run_dir, "sweep_run_manifest.json")
     if not os.path.isfile(manifest):
-        return False
+        return None
     try:
         with open(manifest, encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("status") == "done"
+            return json.load(f)
     except Exception:
-        return False
+        return None
+
+
+def _is_done(run_dir: str) -> bool:
+    data = _read_manifest(run_dir)
+    return bool(data and data.get("status") == "done")
+
+
+def _try_claim_run(run_dir: str, rank: int, run_id: str) -> str | None:
+    """Atomically claim a run directory.
+
+    This protects against two sweep controllers, or two ranks from a broken
+    launch, writing the same run directory concurrently.
+    """
+
+    ensure_dir(run_dir)
+    claim_path = os.path.join(run_dir, ".sweep_claim")
+
+    try:
+        fd = os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
+
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "run_id": run_id,
+                "rank": rank,
+                "pid": os.getpid(),
+                "claimed_at": time.time(),
+            },
+            f,
+            indent=2,
+        )
+    return claim_path
+
+
+def _release_claim(claim_path: str | None) -> None:
+    if not claim_path:
+        return
+    try:
+        os.remove(claim_path)
+    except FileNotFoundError:
+        pass
+
+
+def _collect_rows_from_manifests(plan: list[SweepPoint], output_dir: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for point in plan:
+        run_dir = os.path.join(output_dir, "runs", point.run_id)
+        row = _read_manifest(run_dir)
+        if row is not None:
+            rows.append(row)
+    return rows
 
 
 def _analysis_payload(base: dict[str, Any], point: SweepPoint, run_dir: str, run_name: str) -> dict[str, Any]:
     payload = copy.deepcopy(base)
     payload["bif_root"] = os.path.join(run_dir, "traces")
     payload["out_dir"] = os.path.join(run_dir, "analysis")
-    payload.setdefault("run_name", run_name)
+
+    # Force sweep-specific SwanLab naming. analyze_bif_results otherwise falls
+    # back to make_analyze_name(model_tag, score_col, top_k), which is identical
+    # across sweep points and makes charts hard to distinguish.
+    payload["run_name"] = run_name
+    payload["experiment_name"] = f"analyze_{point.run_id}"
     return payload
 
 
@@ -339,7 +554,11 @@ def _run_payload(base: dict[str, Any], point: SweepPoint, run_dir: str, run_name
     payload = copy.deepcopy(base)
     payload.update({"lr": point.lr, "gamma": point.gamma, "nbeta": point.nbeta})
     payload["out_dir"] = os.path.join(run_dir, "traces")
-    payload.setdefault("run_name", run_name)
+
+    # Also force trace collection names to the sweep point. This prevents a
+    # fixed run_name in base_run_config from making all sweep runs look alike.
+    payload["run_name"] = run_name
+    payload.setdefault("experiment_name", f"bif_{point.run_id}")
     return payload
 
 
@@ -430,160 +649,204 @@ def _load_sweep_config(config_path: str, cli_output_dir: str | None = None) -> t
 
 
 def run_sweep(config_path: str, out_dir: str | None = None, dry_run: bool | None = None) -> pd.DataFrame:
-    cfg, raw_cfg, _ = _load_sweep_config(config_path, out_dir)
-    if dry_run is not None:
-        cfg.execution.dry_run = bool(dry_run)
+    rank, world_size, local_rank = _torchrun_context()
+    dist_started = _init_sweep_dist_if_needed(world_size)
 
-    ensure_dir(cfg.output_dir)
-    ensure_dir(os.path.join(cfg.output_dir, "runs"))
-    _write_yaml(os.path.join(cfg.output_dir, "sweep_config_resolved.yaml"), raw_cfg)
+    try:
+        cfg, raw_cfg, _ = _load_sweep_config(config_path, out_dir)
+        if dry_run is not None:
+            cfg.execution.dry_run = bool(dry_run)
 
-    base_run = _read_yaml(cfg.base_run_config)
-    base_run = _deep_update(base_run, cfg.run_overrides)
+        ensure_dir(cfg.output_dir)
+        ensure_dir(os.path.join(cfg.output_dir, "runs"))
 
-    diagnostics_cfg = diagnostic_config_from_dict(cfg.diagnostics)
-    if "score_col" in cfg.analysis and not cfg.diagnostics.get("split_stability", {}).get("score_col"):
-        diagnostics_cfg.split_stability.score_col = str(cfg.analysis["score_col"])
-        diagnostics_cfg.chain_stability.score_col = str(cfg.analysis["score_col"])
-    if cfg.analysis.get("negate_scores") is not None:
-        diagnostics_cfg.negate_scores = bool(cfg.analysis.get("negate_scores"))
+        if rank == 0:
+            _write_yaml(os.path.join(cfg.output_dir, "sweep_config_resolved.yaml"), raw_cfg)
 
-    plan = _build_plan(cfg)
-    plan_df = pd.DataFrame([asdict(p) for p in plan])
-    plan_df.to_csv(os.path.join(cfg.output_dir, "sweep_plan.csv"), index=False)
+        base_run = _read_yaml(cfg.base_run_config)
+        base_run = _deep_update(base_run, cfg.run_overrides)
 
-    env = os.environ.copy()
-    env.update({str(k): str(v) for k, v in cfg.execution.extra_env.items()})
-    rows: list[dict[str, Any]] = []
+        diagnostics_cfg = diagnostic_config_from_dict(cfg.diagnostics)
+        if "score_col" in cfg.analysis and not cfg.diagnostics.get("split_stability", {}).get("score_col"):
+            diagnostics_cfg.split_stability.score_col = str(cfg.analysis["score_col"])
+            diagnostics_cfg.chain_stability.score_col = str(cfg.analysis["score_col"])
+        if cfg.analysis.get("negate_scores") is not None:
+            diagnostics_cfg.negate_scores = bool(cfg.analysis.get("negate_scores"))
 
-    for idx, point in enumerate(plan):
-        run_dir = os.path.join(cfg.output_dir, "runs", point.run_id)
-        ensure_dir(run_dir)
-        log_path = os.path.join(run_dir, "commands.log")
-        manifest_path = os.path.join(run_dir, "sweep_run_manifest.json")
-        started = time.time()
+        plan = _build_plan(cfg)
+        if rank == 0:
+            plan_df = pd.DataFrame([asdict(p) for p in plan])
+            plan_df.to_csv(os.path.join(cfg.output_dir, "sweep_plan.csv"), index=False)
 
-        if cfg.execution.skip_existing and _is_done(run_dir):
-            with open(manifest_path, encoding="utf-8") as f:
-                existing = json.load(f)
-            rows.append(existing)
-            continue
+        _barrier_if_needed(world_size)
 
-        status = "done"
-        error = ""
-        run_payload = _run_payload(base_run, point, run_dir, point.run_id)
-        analysis_payload = _analysis_payload(cfg.analysis, point, run_dir, point.run_id)
-        _write_yaml(os.path.join(run_dir, "run_config.yaml"), run_payload)
-        _write_yaml(os.path.join(run_dir, "analysis_config.yaml"), analysis_payload)
+        env = _child_env_for_rank(cfg.execution.extra_env, local_rank, world_size)
+        rows: list[dict[str, Any]] = []
 
-        try:
-            if cfg.execution.run_bif:
-                cmd = [cfg.execution.python_executable, "-m", "bif.cli", "run-bif"]
-                cmd.extend(_payload_to_cli_args(run_payload, RUN_BIF_VALUE_FLAGS, RUN_BIF_BOOL_FLAGS))
-                code = _run_subprocess(cmd, cwd=None, env=env, log_path=log_path, dry_run=cfg.execution.dry_run)
-                if code != 0:
-                    raise RuntimeError(f"run-bif failed with exit code {code}")
+        for idx, point in enumerate(plan):
+            # Main torchrun fix: each outer rank owns only its slice of the grid.
+            if idx % world_size != rank:
+                continue
 
-            if cfg.execution.analyze_bif:
-                cmd = [cfg.execution.python_executable, "-m", "bif.cli", "analyze-bif"]
-                cmd.extend(
-                    _payload_to_cli_args(
-                        analysis_payload,
-                        ANALYZE_VALUE_FLAGS,
-                        ANALYZE_BOOL_FLAGS,
-                        ANALYZE_LIST_FLAGS,
+            run_dir = os.path.join(cfg.output_dir, "runs", point.run_id)
+            ensure_dir(run_dir)
+            log_path = os.path.join(run_dir, "commands.log")
+            manifest_path = os.path.join(run_dir, "sweep_run_manifest.json")
+            started = time.time()
+
+            if cfg.execution.skip_existing and _is_done(run_dir):
+                existing = _read_manifest(run_dir)
+                if existing is not None:
+                    rows.append(existing)
+                continue
+
+            claim_path: str | None = None
+            if not cfg.execution.dry_run:
+                claim_path = _try_claim_run(run_dir, rank, point.run_id)
+                if claim_path is None:
+                    # Another rank or another sweep process already owns this run.
+                    existing = _read_manifest(run_dir)
+                    if existing is not None:
+                        rows.append(existing)
+                    continue
+
+            status = "done"
+            error = ""
+            run_payload = _run_payload(base_run, point, run_dir, point.run_id)
+            analysis_payload = _analysis_payload(cfg.analysis, point, run_dir, point.run_id)
+            _write_yaml(os.path.join(run_dir, "run_config.yaml"), run_payload)
+            _write_yaml(os.path.join(run_dir, "analysis_config.yaml"), analysis_payload)
+
+            try:
+                if cfg.execution.run_bif:
+                    cmd = [cfg.execution.python_executable, "-m", "bif.cli", "run-bif"]
+                    cmd.extend(_payload_to_cli_args(run_payload, RUN_BIF_VALUE_FLAGS, RUN_BIF_BOOL_FLAGS))
+                    code = _run_subprocess(cmd, cwd=None, env=env, log_path=log_path, dry_run=cfg.execution.dry_run)
+                    if code != 0:
+                        raise RuntimeError(f"run-bif failed with exit code {code}")
+
+                if cfg.execution.analyze_bif:
+                    cmd = [cfg.execution.python_executable, "-m", "bif.cli", "analyze-bif"]
+                    cmd.extend(
+                        _payload_to_cli_args(
+                            analysis_payload,
+                            ANALYZE_VALUE_FLAGS,
+                            ANALYZE_BOOL_FLAGS,
+                            ANALYZE_LIST_FLAGS,
+                        )
                     )
-                )
-                code = _run_subprocess(cmd, cwd=None, env=env, log_path=log_path, dry_run=cfg.execution.dry_run)
-                if code != 0:
-                    raise RuntimeError(f"analyze-bif failed with exit code {code}")
+                    code = _run_subprocess(cmd, cwd=None, env=env, log_path=log_path, dry_run=cfg.execution.dry_run)
+                    if code != 0:
+                        raise RuntimeError(f"analyze-bif failed with exit code {code}")
 
-            diag_rows = pd.DataFrame()
-            if cfg.execution.diagnostics and not cfg.execution.dry_run:
-                diag_out_dir = os.path.join(run_dir, "diagnostics")
+                if cfg.execution.diagnostics and not cfg.execution.dry_run:
+                    diag_out_dir = os.path.join(run_dir, "diagnostics")
 
-                swan_init_run(
-                    experiment_name=f"diagnostics_{point.run_id}",
-                    run_name=point.run_id,
-                    config={
-                        "stage": "sweep_diagnostics",
-                        "run_id": point.run_id,
-                        "run_dir": run_dir,
-                        "trace_dir": run_payload["out_dir"],
-                        "diagnostics_out_dir": diag_out_dir,
-                        "lr": point.lr,
-                        "gamma": point.gamma,
-                        "nbeta": point.nbeta,
-                        "is_nbeta_zero": point.is_nbeta_zero,
-                        "diagnostics": asdict(diagnostics_cfg),
-                    },
-                    tags=[
-                        "bif",
-                        "sweep",
-                        "diagnostics",
-                        f"lr={point.lr}",
-                        f"gamma={point.gamma}",
-                        f"nbeta={point.nbeta}",
-                    ],
-                )
+                    with _local_single_process_env(local_rank, world_size):
+                        swan_init_run(
+                            experiment_name=f"diagnostics_{point.run_id}",
+                            run_name=point.run_id,
+                            config={
+                                "stage": "sweep_diagnostics",
+                                "run_id": point.run_id,
+                                "run_dir": run_dir,
+                                "trace_dir": run_payload["out_dir"],
+                                "diagnostics_out_dir": diag_out_dir,
+                                "lr": point.lr,
+                                "gamma": point.gamma,
+                                "nbeta": point.nbeta,
+                                "is_nbeta_zero": point.is_nbeta_zero,
+                                "diagnostics": asdict(diagnostics_cfg),
+                                "sweep_rank": rank,
+                                "sweep_world_size": world_size,
+                            },
+                            tags=[
+                                "bif",
+                                "sweep",
+                                "diagnostics",
+                                f"lr={point.lr}",
+                                f"gamma={point.gamma}",
+                                f"nbeta={point.nbeta}",
+                                f"sweep_rank={rank}",
+                            ],
+                        )
 
-                try:
-                    diag_rows = run_diagnostics_for_bif_root(
-                        bif_root=run_payload["out_dir"],
-                        out_dir=diag_out_dir,
-                        cfg=diagnostics_cfg,
-                    )
-                finally:
-                    swan_finish()
+                        try:
+                            run_diagnostics_for_bif_root(
+                                bif_root=run_payload["out_dir"],
+                                out_dir=diag_out_dir,
+                                cfg=diagnostics_cfg,
+                            )
+                        finally:
+                            swan_finish()
 
-            elif cfg.execution.diagnostics and cfg.execution.dry_run:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write("[dry-run] diagnostics not executed\n")
+                elif cfg.execution.diagnostics and cfg.execution.dry_run:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write("[dry-run] diagnostics not executed\n")
 
+            except Exception as exc:
+                status = "error"
+                error = str(exc)
+                if not cfg.execution.continue_on_error:
+                    raise
 
-        except Exception as exc:
-            status = "error"
-            error = str(exc)
-            if not cfg.execution.continue_on_error:
-                raise
+            finally:
+                _release_claim(claim_path)
 
-        elapsed = time.time() - started
-        row: dict[str, Any] = {
-            "run_id": point.run_id,
-            "run_dir": run_dir,
-            "lr": point.lr,
-            "gamma": point.gamma,
-            "nbeta": point.nbeta,
-            "is_nbeta_zero": point.is_nbeta_zero,
-            "status": status,
-            "error": error,
-            "elapsed_sec": elapsed,
-        }
-        diag_csv = os.path.join(run_dir, "diagnostics", "diagnostics_summary.csv")
-        if status == "done" and os.path.isfile(diag_csv):
-            diag_df = pd.read_csv(diag_csv)
-            if not diag_df.empty:
-                diag_row = diag_df.iloc[0].to_dict()
-                row.update({k: v for k, v in diag_row.items() if k not in row})
-        rows.append(row)
-        save_json(manifest_path, row)
+            elapsed = time.time() - started
+            row: dict[str, Any] = {
+                "run_id": point.run_id,
+                "run_dir": run_dir,
+                "lr": point.lr,
+                "gamma": point.gamma,
+                "nbeta": point.nbeta,
+                "is_nbeta_zero": point.is_nbeta_zero,
+                "status": status,
+                "error": error,
+                "elapsed_sec": elapsed,
+                "sweep_rank": rank,
+                "sweep_world_size": world_size,
+            }
+            diag_csv = os.path.join(run_dir, "diagnostics", "diagnostics_summary.csv")
+            if status == "done" and os.path.isfile(diag_csv):
+                diag_df = pd.read_csv(diag_csv)
+                if not diag_df.empty:
+                    diag_row = diag_df.iloc[0].to_dict()
+                    row.update({k: v for k, v in diag_row.items() if k not in row})
+            rows.append(row)
+            save_json(manifest_path, row)
 
-        pd.DataFrame(rows).to_csv(os.path.join(cfg.output_dir, "sweep_summary.partial.csv"), index=False)
+            pd.DataFrame(rows).to_csv(
+                os.path.join(cfg.output_dir, f"sweep_summary.rank{rank:03d}.partial.csv"),
+                index=False,
+            )
 
-    summary = pd.DataFrame(rows)
-    if not cfg.execution.dry_run:
-        summary = _add_baseline_comparisons(summary, cfg.output_dir, diagnostics_cfg, cfg.baseline)
-    summary.to_csv(os.path.join(cfg.output_dir, "sweep_summary.csv"), index=False)
-    save_json(
-        os.path.join(cfg.output_dir, "sweep_summary_meta.json"),
-        {
-            "num_runs": int(len(summary)),
-            "num_done": int((summary.get("status") == "done").sum()) if "status" in summary else 0,
-            "num_error": int((summary.get("status") == "error").sum()) if "status" in summary else 0,
-            "diagnostics": asdict(diagnostics_cfg),
-        },
-    )
-    return summary
+        _barrier_if_needed(world_size)
+
+        if rank == 0:
+            all_rows = _collect_rows_from_manifests(plan, cfg.output_dir)
+            summary = pd.DataFrame(all_rows)
+
+            if not cfg.execution.dry_run:
+                summary = _add_baseline_comparisons(summary, cfg.output_dir, diagnostics_cfg, cfg.baseline)
+
+            summary.to_csv(os.path.join(cfg.output_dir, "sweep_summary.csv"), index=False)
+            save_json(
+                os.path.join(cfg.output_dir, "sweep_summary_meta.json"),
+                {
+                    "num_runs": int(len(summary)),
+                    "num_done": int((summary.get("status") == "done").sum()) if "status" in summary else 0,
+                    "num_error": int((summary.get("status") == "error").sum()) if "status" in summary else 0,
+                    "sweep_world_size": int(world_size),
+                    "diagnostics": asdict(diagnostics_cfg),
+                },
+            )
+            return summary
+
+        return pd.DataFrame(rows)
+
+    finally:
+        _destroy_sweep_dist_if_started(dist_started)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -591,9 +854,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", required=True, help="YAML sweep config")
     parser.add_argument("--out_dir", default=None, help="Override output_dir in config")
     parser.add_argument("--dry_run", action="store_true", help="Write the run plan without launching commands")
+    parser.add_argument("--local-rank", "--local_rank", dest="local_rank", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     summary = run_sweep(args.config, out_dir=args.out_dir, dry_run=args.dry_run if args.dry_run else None)
-    print(summary.tail(min(20, len(summary))).to_string(index=False))
+
+    rank, world_size, _ = _torchrun_context()
+    if rank == 0 or world_size == 1:
+        print(summary.tail(min(20, len(summary))).to_string(index=False))
 
 
 if __name__ == "__main__":
