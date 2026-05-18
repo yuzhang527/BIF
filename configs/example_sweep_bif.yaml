@@ -76,6 +76,7 @@ diagnostics:
     num_splits: 20
     split_fraction: 0.5
     top_k: [150]
+    bottom_k: [150]
     score_col: cross_corr_mean_over_queries
     pass_threshold: 0.4
     seed: 42

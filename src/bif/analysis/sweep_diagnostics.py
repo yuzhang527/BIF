@@ -37,6 +37,7 @@ class SplitStabilityConfig:
     num_splits: int = 20
     split_fraction: float = 0.5
     top_k: list[int] = field(default_factory=lambda: [50, 100, 500])
+    bottom_k: list[int] = field(default_factory=list) 
     score_col: str = "bif_mean"
     pass_threshold: float = 0.9
     seed: int = 42
@@ -123,6 +124,38 @@ def topk_overlap_metrics(scores_a: np.ndarray, scores_b: np.ndarray, top_k: list
         union = len(a | b)
         out[f"top{k}_overlap_recall"] = float(inter / denom) if denom > 0 else float("nan")
         out[f"top{k}_jaccard"] = float(inter / union) if union > 0 else float("nan")
+    return out
+
+def _bottom_indices(scores: np.ndarray, k: int) -> np.ndarray:
+    scores = np.asarray(scores, dtype=np.float64)
+    finite = np.isfinite(scores)
+    if not finite.any():
+        return np.array([], dtype=np.int64)
+
+    idx = np.where(finite)[0]
+    k_eff = min(int(k), len(idx))
+    if k_eff <= 0:
+        return np.array([], dtype=np.int64)
+
+    order = np.argsort(scores[idx], kind="mergesort")[:k_eff]
+    return idx[order]
+
+
+def bottomk_overlap_metrics(scores_a: np.ndarray, scores_b: np.ndarray, bottom_k: list[int]) -> dict[str, float]:
+    """Return bottom-K overlap-recall and Jaccard metrics for several K values."""
+    out: dict[str, float] = {}
+
+    for k in bottom_k:
+        a = set(map(int, _bottom_indices(scores_a, k)))
+        b = set(map(int, _bottom_indices(scores_b, k)))
+
+        inter = len(a & b)
+        denom = min(int(k), len(a), len(b))
+        union = len(a | b)
+
+        out[f"bottom{k}_overlap_recall"] = float(inter / denom) if denom > 0 else float("nan")
+        out[f"bottom{k}_jaccard"] = float(inter / union) if union > 0 else float("nan")
+
     return out
 
 
@@ -217,6 +250,10 @@ def compute_split_stability(
             "score_spearman": _corr(score_a, score_b, "spearman"),
         }
         row.update(topk_overlap_metrics(score_a, score_b, cfg.top_k))
+
+        if cfg.bottom_k:
+            row.update(bottomk_overlap_metrics(score_a, score_b, cfg.bottom_k))
+
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -463,25 +500,34 @@ def _log_checkpoint_summary(
         for key in summary.keys()
         if (
             key.startswith("split_top")
+            or key.startswith("split_bottom")
             or key.startswith("chain_top")
         )
         and key.endswith("_overlap_recall_mean")
     ]
 
     def _sort_key(key: str) -> tuple[int, int]:
-        # split first, chain second
-        kind_order = 0 if key.startswith("split_") else 1
+    # split top, split bottom, chain top
+        if key.startswith("split_top"):
+            kind_order = 0
+            marker = "_top"
+        elif key.startswith("split_bottom"):
+            kind_order = 1
+            marker = "_bottom"
+        elif key.startswith("chain_top"):
+            kind_order = 2
+            marker = "_top"
+        else:
+            kind_order = 9
+            marker = "_top"
 
-        # Extract K from keys like:
-        #   split_top150_overlap_recall_mean
-        #   chain_top150_overlap_recall_mean
         try:
-            top_part = key.split("_top", 1)[1]
-            k = int(top_part.split("_", 1)[0])
+            k = int(key.split(marker, 1)[1].split("_", 1)[0])
         except Exception:
             k = 10**9
 
         return kind_order, k
+
 
     wanted_keys = sorted(wanted_keys, key=_sort_key)
 
