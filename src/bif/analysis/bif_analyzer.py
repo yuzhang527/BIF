@@ -48,6 +48,7 @@ class AnalyzeConfig:
 
     score_col: str = "bif_mean"
     top_k: int | None = None
+    bottom_k: int | None = None
     negate_scores: bool = False
     save_full_query_matrix: bool = False
     enable_aux_query_plots: bool = False
@@ -86,6 +87,9 @@ def _auto_adapt_config(
 
     if acfg.top_k is None:
         acfg.top_k = min(500, pool_size)
+
+    if acfg.bottom_k is None:
+        acfg.bottom_k = acfg.top_k
 
     if acfg.hist_bins is None:
         acfg.hist_bins = min(60, max(20, pool_size // 10))
@@ -1105,7 +1109,14 @@ def _process_one_checkpoint(
     ensure_dir(ck_out)
 
     df.to_csv(f"{ck_out}/pool_scores.csv", index=False)
-    df.head(acfg.top_k).to_csv(f"{ck_out}/top_{acfg.top_k}.csv", index=False)
+    top_k = min(int(acfg.top_k or 0), len(df))
+    bottom_k = min(int(acfg.bottom_k or 0), len(df))
+
+    top_df = df.head(top_k).copy()
+    bottom_df = df.tail(bottom_k).iloc[::-1].reset_index(drop=True)
+
+    top_df.to_csv(f"{ck_out}/top_{top_k}.csv", index=False)
+    bottom_df.to_csv(f"{ck_out}/bottom_{bottom_k}.csv", index=False)
 
     # New canonical matrix: pool × query.
     pool_query_matrix_path = f"{ck_out}/pool_query_corr_matrix.npy"

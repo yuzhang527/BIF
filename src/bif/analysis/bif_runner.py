@@ -65,6 +65,16 @@ def _get_distributed_context() -> tuple[int, int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     return rank, world_size, local_rank
 
+def infinite_dataloader(loader):
+    """Yield batches forever, re-creating the DataLoader iterator each epoch.
+
+    Unlike itertools.cycle(loader), this does not cache the first epoch's batches.
+    With shuffle=True, each new epoch gets a fresh shuffled order.
+    """
+    while True:
+        for batch in loader:
+            yield batch
+
 
 def _barrier() -> None:
     if dist.is_available() and dist.is_initialized():
@@ -783,9 +793,7 @@ def run_bif(
             noise_gen = torch.Generator(device=device)
             noise_gen.manual_seed(sgld_cfg.seed + chain_id)
 
-        from itertools import cycle as _cycle
         from torch.utils.data import DataLoader as _DataLoader
-
         from bif.data.dataset import collate_bif_batch as _collate
 
         loader = _DataLoader(
@@ -796,7 +804,8 @@ def run_bif(
             drop_last=True,
             collate_fn=_collate,
         )
-        feed = _cycle(loader)
+
+        feed = infinite_dataloader(loader)
 
         chain_dir = f"{out_dir}/chain_{chain_id:03d}"
         ensure_dir(chain_dir)
