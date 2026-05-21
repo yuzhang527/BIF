@@ -67,24 +67,14 @@ def main():
             else:
                 text = fallback_chat_text(messages)
 
-            assistant_text = ""
-            for m in reversed(messages):
-                if m.get("role") == "assistant":
-                    assistant_text = m.get("content", "")
-                    break
-
-            answer_start_char = text.rfind(assistant_text) if assistant_text else -1
-
             out = {
                 "id": record.get("id", f"sample_{idx:06d}"),
                 "source": record.get("source", "alignment"),
                 "behavior_type": record.get("behavior_type", "unknown"),
                 "prompt_harm": record.get("prompt_harm", "unknown"),
                 "text": text,
+                "messages": messages,
             }
-
-            if answer_start_char >= 0:
-                out["answer_start_char"] = answer_start_char
 
             fout.write(json.dumps(out, ensure_ascii=False) + "\n")
             n += 1
