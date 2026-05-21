@@ -1,14 +1,14 @@
-model_name_or_path: ./step2000
-tokenizer_path: ./step2000
-pool_jsonl: ./data/pool_800.jsonl
-query_jsonl: ./data/query_gsm8k_20.jsonl
-out_dir: ./runs/bif_traces
+model_name_or_path: /root/Qwen2.5-0.5B-Instruct
+tokenizer_path: /root/Qwen2.5-0.5B-Instruct
+pool_jsonl: /root/data/alignment/stage1_alignment_train.bif.jsonl
+query_jsonl: /root/data/alignment/eval_xstest_safe.bif.jsonl
+out_dir: ./runs/qwen25
 
 num_chains: 2
-draws_per_chain: 300
+draws_per_chain: 100
 max_length: 512
-train_batch_size: 128
-eval_batch_size: 128
+train_batch_size: 32
+eval_batch_size: 32
 pool_eval_subset: 0
 
 lr: 5e-6

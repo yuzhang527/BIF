@@ -14,24 +14,29 @@ from bif.constants import IGNORE_INDEX
 
 
 def per_token_causal_lm_loss(
-    input_ids: torch.Tensor,
+    labels: torch.Tensor,
     logits: torch.Tensor,
     ignore_index: int = IGNORE_INDEX,
 ) -> torch.Tensor:
-    """Compute per-token causal LM loss (aligned with devinterp compute_per_token_loss).
+    """Compute masked per-token causal LM loss.
 
-    Args:
-        input_ids: Token IDs of shape (batch, seq_len).
-        logits: Model logits of shape (batch, seq_len, vocab_size).
-        ignore_index: Label value to ignore in loss computation.
-
-    Returns:
-        Per-token loss tensor of shape (batch, seq_len - 1).
+    Returns shape: (batch, seq_len - 1).
+    Ignored positions are set to 0.0.
     """
     log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+
     shift_log_probs = log_probs[:, :-1, :]
-    shift_input_ids = input_ids[:, 1:, None]
-    return -shift_log_probs.gather(dim=-1, index=shift_input_ids)[:, :, 0]
+    shift_labels = labels[:, 1:].contiguous()
+    valid_mask = shift_labels.ne(ignore_index)
+
+    safe_labels = shift_labels.masked_fill(~valid_mask, 0)
+    token_loss = -shift_log_probs.gather(
+        dim=-1,
+        index=safe_labels.unsqueeze(-1),
+    ).squeeze(-1)
+
+    return token_loss.masked_fill(~valid_mask, 0.0)
+
 
 
 def per_example_causal_lm_loss(

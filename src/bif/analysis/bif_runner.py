@@ -294,6 +294,8 @@ class Observable:
 
         all_input_ids: list[torch.Tensor] = []
         all_attention_mask: list[torch.Tensor] = []
+        all_labels: list[torch.Tensor] = []
+
 
         for start in range(0, self.n_samples, eval_batch_size):
             batch_indices = indices[start:start + eval_batch_size]
@@ -305,9 +307,12 @@ class Observable:
             self.task_types.extend(batch["task_types"])
             all_input_ids.append(batch["input_ids"])
             all_attention_mask.append(batch["attention_mask"])
+            all_labels.append(batch["labels"])
+
 
         self.input_ids = torch.cat(all_input_ids, dim=0).to(device)
         self.attention_mask = torch.cat(all_attention_mask, dim=0).to(device)
+        self.labels = torch.cat(all_labels, dim=0).to(device)
         self.seq_len = self.input_ids.shape[1]
         self.context_length = self.seq_len - 1
 
@@ -321,19 +326,20 @@ class Observable:
                 end = min(start + self.eval_batch_size, self.n_samples)
                 ids = self.input_ids[start:end]
                 mask = self.attention_mask[start:end]
+                labels = self.labels[start:end]
 
                 outputs = model(input_ids=ids, attention_mask=mask)
+
                 token_loss = per_token_causal_lm_loss(
-                    input_ids=ids,
+                    labels=labels,
                     logits=outputs.logits,
                 )
 
-                labels = ids.clone()
-                labels[mask == 0] = -100
                 seq_loss = per_example_causal_lm_loss(
                     labels=labels,
                     logits=outputs.logits,
                 )
+
 
                 all_token_losses.append(token_loss.cpu())
                 all_seq_losses.append(seq_loss.cpu())

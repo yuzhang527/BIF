@@ -32,12 +32,12 @@
 # .sweep_claim file and resume with skip_existing: true.
 
 base_run_config: example_run_bif.yaml
-output_dir: /root/BIF/runs/bif_sweeps/example_sweep
+output_dir: /root/BIF/runs/bif_sweeps/qwen25
 
 # Optional overrides applied on top of base_run_config before each grid point.
 # Keep these small for a first diagnostic sweep.
 run_overrides:
-  draws_per_chain: 100
+  draws_per_chain: 50
   num_chains: 2
   num_burnin_steps: 100
   num_steps_bw_draws: 2
@@ -45,11 +45,11 @@ run_overrides:
 
 sweep:
   lr:
-    values: [1.0e-4]
+    values: [1.0e-5, 1.0e-4]
   gamma:
-    values: [100, 1000]
+    values: [10, 100, 1000]
   nbeta:
-    values: [100]
+    values: [10, 100, 1000]
 
 baseline:
   # Adds one nbeta=0 run for every lr x gamma pair unless nbeta=0 is already in the grid.
@@ -61,7 +61,7 @@ baseline:
 
 analysis:
   score_col: cross_corr_mean_over_queries
-  top_k: 150
+  top_k: 100
   enable_aux_query_plots: false
   negate_scores: false
 
@@ -75,8 +75,8 @@ diagnostics:
     enabled: true
     num_splits: 20
     split_fraction: 0.5
-    top_k: [500]
-    bottom_k: [500]
+    top_k: [100]
+    bottom_k: [100]
     score_col: cross_corr_mean_over_queries
     pass_threshold: 0.4
     seed: 42
@@ -84,7 +84,7 @@ diagnostics:
 
   chain_stability:
     enabled: true
-    top_k: [150]
+    top_k: [100]
     score_col: cross_corr_mean_over_queries
     min_draws_per_chain: 4
 
