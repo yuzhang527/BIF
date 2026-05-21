@@ -254,11 +254,9 @@ def _load_traces_npz(chain_dirs: list[str]) -> dict[str, Any]:
     for cdir in chain_dirs:
         pool_npz = np.load(os.path.join(cdir, "observable_loss_trace.npz"))
         pool_seq_parts.append(pool_npz["seq_loss"])
-        pool_token_parts.append(pool_npz["token_loss"])
 
         query_npz = np.load(os.path.join(cdir, "query_loss_trace.npz"))
         query_seq_parts.append(query_npz["seq_loss"])
-        query_token_parts.append(query_npz["token_loss"])
 
         if pool_meta is None:
             import json as _json
@@ -268,9 +266,7 @@ def _load_traces_npz(chain_dirs: list[str]) -> dict[str, Any]:
                 query_meta = _json.load(f)
 
     pool_seq = np.concatenate(pool_seq_parts, axis=0)
-    pool_token = np.concatenate(pool_token_parts, axis=0)
     query_seq = np.concatenate(query_seq_parts, axis=0)
-    query_token = np.concatenate(query_token_parts, axis=0)
 
     pool_nan_frac = float(np.isnan(pool_seq).mean())
     query_nan_frac = float(np.isnan(query_seq).mean())
@@ -292,11 +288,9 @@ def _load_traces_npz(chain_dirs: list[str]) -> dict[str, Any]:
     return {
         "pool_ids": pool_meta["sample_ids"],
         "pool_seq_loss": pool_seq,
-        "pool_token_loss": pool_token,
         "pool_meta": pool_meta,
         "query_ids": query_meta["sample_ids"],
         "query_seq_loss": query_seq,
-        "query_token_loss": query_token,
         "query_meta": query_meta,
         "num_draws": pool_seq.shape[0],
         "num_chains": num_chains,
@@ -331,17 +325,15 @@ def _load_traces_legacy(chain_dirs: list[str]) -> dict[str, Any]:
         num_chains = 1
         draws_per_chain = num_draws
 
-    pool_token_loss = pool_mat[:, :, np.newaxis]
-    query_token_loss = query_mat[:, :, np.newaxis]
+    
+    
 
     return {
         "pool_ids": pool_ids,
         "pool_seq_loss": pool_mat,
-        "pool_token_loss": pool_token_loss,
         "pool_meta": pool_meta,
         "query_ids": query_ids,
         "query_seq_loss": query_mat,
-        "query_token_loss": query_token_loss,
         "query_meta": query_meta,
         "num_draws": num_draws,
         "num_chains": num_chains,
@@ -513,87 +505,6 @@ def compute_bif_pairwise(
     return corr.cpu().numpy()
 
 
-def compute_bif_tokenwise(
-    token_loss: np.ndarray,
-    num_chains: int = 1,
-    reduce_chains: str = "stack",
-    batch_size: int = 32,
-    device: str | None = None,
-) -> np.ndarray:
-    """Compute token-level BIF (aligned with devinterp _tokenwise_bif).
-
-    Args:
-        token_loss: Shape (num_draws, n_samples, context_length).
-        num_chains: Number of chains.
-        reduce_chains: "stack" or "mean".
-        batch_size: Batch size for block processing.
-        device: Torch device.
-
-    Returns:
-        Token-level BIF of shape (n_samples, n_samples, context_length, context_length).
-    """
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if reduce_chains == "stack":
-        loss = token_loss.transpose(1, 0, 2)
-    elif reduce_chains == "mean":
-        draws_per_chain = token_loss.shape[0] // num_chains
-        reshaped = token_loss.reshape(num_chains, draws_per_chain, -1, token_loss.shape[2])
-        loss = reshaped.mean(axis=0).transpose(1, 0, 2)
-    else:
-        raise ValueError(f"Unknown reduce_chains: {reduce_chains}")
-
-    n_samples = loss.shape[0]
-    n_tokens = loss.shape[2]
-    result = np.empty((n_samples, n_tokens, n_samples, n_tokens), dtype=np.float32)
-
-    for i in range(0, n_samples, batch_size):
-        for j in range(0, n_samples, batch_size):
-            bi = min(batch_size, n_samples - i)
-            bj = min(batch_size, n_samples - j)
-            block_i = torch.as_tensor(loss[i:i+bi], device=device)
-            block_j = torch.as_tensor(loss[j:j+bj], device=device)
-            block_corr = _batch_corrcoef_tokenwise(block_i, block_j)
-            result[i:i+bi, :, j:j+bj, :] = block_corr.cpu().numpy()
-            del block_i, block_j, block_corr
-
-    return result.transpose(0, 2, 1, 3)
-
-
-def _batch_corrcoef_tokenwise(
-    a: torch.Tensor, b: torch.Tensor
-) -> torch.Tensor:
-    """Batched token-wise correlation.
-
-    Args:
-        a: shape (n_a, series_a, observations) — (batch, tokens, draws)
-        b: shape (n_b, series_b, observations)
-
-    Returns:
-        shape (n_a, n_b, series_a, series_b) cross-correlation block.
-    """
-    n_a, series_a, n_obs = a.shape
-    n_b, series_b, _ = b.shape
-
-    a_centered = a - a.mean(dim=2, keepdim=True)
-    b_centered = b - b.mean(dim=2, keepdim=True)
-
-    a_broadcast = a_centered[:, None, :, :].expand(n_a, n_b, series_a, n_obs)
-    b_broadcast = b_centered[None, :, :, :].expand(n_a, n_b, series_b, n_obs)
-    combined = torch.cat([a_broadcast, b_broadcast], dim=2)
-
-    cov = combined @ combined.transpose(-1, -2) / (n_obs - 1)
-
-    diag = torch.diagonal(cov, dim1=-2, dim2=-1)
-    std = torch.sqrt(diag)
-    cov /= std.unsqueeze(-1) * std.unsqueeze(-2)
-
-    eye = torch.eye(cov.shape[-1], dtype=cov.dtype, device=cov.device)
-    cov *= 1 - eye
-    cov += eye
-
-    return cov[:, :, :series_a, series_a:]
 
 
 def compute_bif_scores(
@@ -1137,6 +1048,15 @@ def _process_one_checkpoint(
             "score_mean": float(np.nanmean(scores_arr)),
             "score_std": float(np.nanstd(scores_arr)),
         }
+        core_summary.update(
+            _compute_rhat_summary(
+                pool_seq,
+                num_chains,
+                max_samples=acfg.rhat_max_samples,
+                min_draws=acfg.rhat_min_draws,
+            )
+        )
+
 
         save_json(
             f"{ck_out}/ckpt_meta.json",
@@ -2081,34 +2001,39 @@ def _global_analysis(
             "checkpoint",
             "score_mean",
             "score_std",
-            "bif_offdiag_mean",
-            "bif_offdiag_std",
-            "bif_positive_frac",
+            "cross_corr_mean",
+            "cross_corr_std",
+            "cross_corr_min",
+            "cross_corr_max",
             "rhat_mean",
             "rhat_max",
             "num_draws",
         ]
+
         rows = []
         for _, row in summary_df.iterrows():
             rows.append([
-                str(row.get("checkpoint", "")),
-                f"{float(row.get('score_mean', 0.0)):.4f}",
-                f"{float(row.get('score_std', 0.0)):.4f}",
-                f"{float(row.get('bif_offdiag_mean', 0.0)):.4f}",
-                f"{float(row.get('bif_offdiag_std', 0.0)):.4f}",
-                f"{float(row.get('bif_positive_frac', 0.0)):.4f}",
-                f"{float(row.get('rhat_mean', float('nan'))):.4f}",
-                f"{float(row.get('rhat_max', float('nan'))):.4f}",
-                str(int(row.get("num_draws", 0))),
-            ])
+            str(row.get("checkpoint", "")),
+            f"{float(row.get('score_mean', 0.0)):.4f}",
+            f"{float(row.get('score_std', 0.0)):.4f}",
+            f"{float(row.get('cross_corr_mean', 0.0)):.4f}",
+            f"{float(row.get('cross_corr_std', 0.0)):.4f}",
+            f"{float(row.get('cross_corr_min', 0.0)):.4f}",
+            f"{float(row.get('cross_corr_max', 0.0)):.4f}",
+            f"{float(row.get('rhat_mean', float('nan'))):.4f}",
+            f"{float(row.get('rhat_max', float('nan'))):.4f}",
+            str(int(row.get("num_draws", 0))),
+        ])
+
         log_table("1_diag_global/checkpoint_summary", headers=headers, rows=rows)
 
         xaxis = summary_df["checkpoint"].astype(str).tolist()
         global_series = {
-            "bif_offdiag_mean": summary_df["bif_offdiag_mean"].astype(float).round(6).tolist(),
-            "bif_positive_frac": summary_df["bif_positive_frac"].astype(float).round(6).tolist(),
+            "cross_corr_mean": summary_df["cross_corr_mean"].astype(float).round(6).tolist(),
             "score_mean": summary_df["score_mean"].astype(float).round(6).tolist(),
+            "score_std": summary_df["score_std"].astype(float).round(6).tolist(),
         }
+
         log_line("1_diag_global/core_metrics", xaxis=xaxis, series=global_series, smooth=False)
 
         if "rhat_mean" in summary_df.columns:
@@ -2413,14 +2338,16 @@ def analyze_bif_results(
                     "score_std": float(df[acfg.score_col].std()),
                     "num_draws": int(meta.get("num_draws", 0)),
                     "pool_size": len(df),
-                    "bif_offdiag_mean": float(meta.get("bif_offdiag_mean", 0.0)),
-                    "bif_offdiag_std": float(meta.get("bif_offdiag_std", 0.0)),
-                    "bif_positive_frac": float(meta.get("bif_positive_frac", 0.0)),
-                    "bif_abs_mean": float(meta.get("bif_abs_mean", 0.0)),
+                    "query_size": int(meta.get("query_size", 0)),
+                    "cross_corr_mean": float(meta.get("cross_corr_mean", 0.0)),
+                    "cross_corr_std": float(meta.get("cross_corr_std", 0.0)),
+                    "cross_corr_min": float(meta.get("cross_corr_min", 0.0)),
+                    "cross_corr_max": float(meta.get("cross_corr_max", 0.0)),
                     "rhat_mean": float(meta.get("rhat_mean", float("nan"))),
                     "rhat_max": float(meta.get("rhat_max", float("nan"))),
                 }
             )
+
             valid_names.append(ck_name)
 
         _global_analysis(

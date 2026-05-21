@@ -45,7 +45,7 @@ run_overrides:
 
 sweep:
   lr:
-    values: [1.0e-5, 1.0e-4]
+    values: [1.0e-6]
   gamma:
     values: [10, 100, 1000]
   nbeta:
