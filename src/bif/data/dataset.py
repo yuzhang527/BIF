@@ -106,37 +106,22 @@ class JsonlSequenceDataset(Dataset):
 
     def _encode_with_messages(self, messages: list[dict[str, str]]) -> dict[str, torch.Tensor]:
         tokenizer = self.tokenizer
-        has_chat_template = getattr(tokenizer, "chat_template", None) is not None
+        template = getattr(tokenizer, "chat_template", None) or self._FALLBACK_CHAT_TEMPLATE
 
-        if has_chat_template:
-            prompt_result = tokenizer.apply_chat_template(
-                messages[:-1],
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors="pt",
-            )
-            full_result = tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=False,
-                tokenize=True,
-                return_tensors="pt",
-            )
-        else:
-            old_template = getattr(tokenizer, "chat_template", None)
-            tokenizer.chat_template = self._FALLBACK_CHAT_TEMPLATE
-            prompt_result = tokenizer.apply_chat_template(
-                messages[:-1],
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors="pt",
-            )
-            full_result = tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=False,
-                tokenize=True,
-                return_tensors="pt",
-            )
-            tokenizer.chat_template = old_template
+        prompt_result = tokenizer.apply_chat_template(
+            messages[:-1],
+            chat_template=template,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt",
+        )
+        full_result = tokenizer.apply_chat_template(
+            messages,
+            chat_template=template,
+            add_generation_prompt=False,
+            tokenize=True,
+            return_tensors="pt",
+        )
 
         prompt_ids = self._extract_ids(prompt_result)
         full_ids = self._extract_ids(full_result)
