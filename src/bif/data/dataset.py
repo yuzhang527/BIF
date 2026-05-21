@@ -15,7 +15,35 @@ from bif.constants import IGNORE_INDEX
 
 
 class JsonlSequenceDataset(Dataset):
-    """Dataset for BIF trace collection with per-sample metadata."""
+    """Dataset for BIF trace collection with per-sample metadata.
+
+    Supports three sources for prompt masking (in priority order):
+
+    1. **messages** field in the JSONL row — uses the tokenizer's
+       ``apply_chat_template`` (if available) or a fallback format to
+       build token-level masks automatically.  This is the recommended
+       approach because it avoids the character↔token boundary mismatch
+       that ``answer_start_char`` can introduce.
+
+    2. **answer_start_char** field — legacy character-level boundary.
+       The prompt portion (``text[:answer_start_char]``) is tokenized
+       separately and the resulting token count is used to mask labels.
+
+    3. No mask — all non-padding tokens contribute to loss (CPT-style).
+    """
+
+    _FALLBACK_CHAT_TEMPLATE = (
+        "{% for message in messages %}"
+        "{% if message['role'] == 'user' %}"
+        "### User:\n{{ message['content'] }}\n\n"
+        "{% elif message['role'] == 'assistant' %}"
+        "### Assistant:\n{{ message['content'] }}\n\n"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "### Assistant:\n"
+        "{% endif %}"
+    )
 
     def __init__(
         self,
@@ -28,6 +56,7 @@ class JsonlSequenceDataset(Dataset):
         subtype_key: str = "subtype",
         task_type_key: str = "task_type",
         strict: bool = True,
+        messages_key: str = "messages",
     ):
         self.examples: list[dict[str, Any]] = []
         self.tokenizer = tokenizer
@@ -46,7 +75,9 @@ class JsonlSequenceDataset(Dataset):
                 "subtype": obj.get(subtype_key),
                 "task_type": obj.get(task_type_key),
             }
-            if "answer_start_char" in obj:
+            if messages_key in obj and isinstance(obj[messages_key], list):
+                meta["messages"] = obj[messages_key]
+            elif "answer_start_char" in obj:
                 meta["answer_start_char"] = obj["answer_start_char"]
             self.examples.append({**meta, "text": str(obj[text_key])})
 
@@ -61,7 +92,68 @@ class JsonlSequenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.examples)
 
+    @staticmethod
+    def _extract_ids(result) -> list[int]:
+        if isinstance(result, list) and len(result) > 0 and isinstance(result[0], int):
+            return result
+        if hasattr(result, "input_ids"):
+            ids = result["input_ids"]
+            if hasattr(ids, "squeeze"):
+                return ids.squeeze(0).tolist()
+            if isinstance(ids, list):
+                return ids[0] if ids and isinstance(ids[0], list) else ids
+        raise TypeError(f"Cannot extract token ids from {type(result)}")
+
+    def _encode_with_messages(self, messages: list[dict[str, str]]) -> dict[str, torch.Tensor]:
+        tokenizer = self.tokenizer
+        template = getattr(tokenizer, "chat_template", None) or self._FALLBACK_CHAT_TEMPLATE
+
+        prompt_result = tokenizer.apply_chat_template(
+            messages[:-1],
+            chat_template=template,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt",
+        )
+        full_result = tokenizer.apply_chat_template(
+            messages,
+            chat_template=template,
+            add_generation_prompt=False,
+            tokenize=True,
+            return_tensors="pt",
+        )
+
+        prompt_ids = self._extract_ids(prompt_result)
+        full_ids = self._extract_ids(full_result)
+
+        if tokenizer.eos_token_id is not None and full_ids[-1] != tokenizer.eos_token_id:
+            full_ids = full_ids + [tokenizer.eos_token_id]
+
+        prompt_len = min(len(prompt_ids), self.max_length)
+        if len(full_ids) > self.max_length:
+            full_ids = full_ids[: self.max_length]
+
+        pad_len = self.max_length - len(full_ids)
+        pad_id = tokenizer.pad_token_id or 0
+        attention_mask = [1] * len(full_ids) + [0] * pad_len
+        input_ids = full_ids + [pad_id] * pad_len
+
+        labels = [IGNORE_INDEX] * prompt_len + full_ids[prompt_len:]
+        labels = labels + [IGNORE_INDEX] * pad_len
+        labels = labels[: self.max_length]
+
+        return {
+            "input_ids": torch.tensor(input_ids[: self.max_length], dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask[: self.max_length], dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+
     def _encode(self, ex: dict[str, Any]) -> dict[str, torch.Tensor]:
+        messages = ex.get("messages")
+
+        if messages is not None:
+            return self._encode_with_messages(messages)
+
         answer_start_char = ex.get("answer_start_char")
 
         if answer_start_char is not None:
