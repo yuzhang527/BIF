@@ -64,9 +64,10 @@ class JsonlSequenceDataset(Dataset):
 
         rows = read_jsonl(path)
         for idx, obj in enumerate(rows):
-            if text_key not in obj:
+            has_messages = messages_key in obj and isinstance(obj[messages_key], list)
+            if text_key not in obj and not has_messages:
                 if strict:
-                    raise ValueError(f"Missing '{text_key}' in {path} line {idx + 1}")
+                    raise ValueError(f"Missing '{text_key}' or '{messages_key}' in {path} line {idx + 1}")
                 continue
             ex_id = obj.get(id_key, idx)
             meta = {
@@ -75,11 +76,12 @@ class JsonlSequenceDataset(Dataset):
                 "subtype": obj.get(subtype_key),
                 "task_type": obj.get(task_type_key),
             }
-            if messages_key in obj and isinstance(obj[messages_key], list):
+            if has_messages:
                 meta["messages"] = obj[messages_key]
             elif "answer_start_char" in obj:
                 meta["answer_start_char"] = obj["answer_start_char"]
-            self.examples.append({**meta, "text": str(obj[text_key])})
+            meta["text"] = str(obj[text_key]) if text_key in obj else ""
+            self.examples.append(meta)
 
         if not self.examples:
             raise ValueError(f"No usable examples in {path}")
