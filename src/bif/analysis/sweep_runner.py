@@ -92,6 +92,10 @@ ANALYZE_VALUE_FLAGS = {
     "out_dir",
     "score_col",
     "top_k",
+    "pool_jsonl",
+    "query_jsonl",
+    "query_group_key",
+    "group_top_k",
     "experiment_name",
     "run_name",
     "hist_bins",
@@ -112,7 +116,7 @@ ANALYZE_VALUE_FLAGS = {
 }
 
 ANALYZE_LIST_FLAGS = {"convergence_checkpoints"}
-ANALYZE_BOOL_FLAGS = {"enable_aux_query_plots", "negate_scores"}
+ANALYZE_BOOL_FLAGS = {"enable_aux_query_plots", "negate_scores","save_group_rankings","save_decoded_text"}
 
 # Environment keys created by torchrun / torch elastic. These must not leak from
 # an outer sweep-level torchrun process into child run-bif/analyze-bif processes.
@@ -632,6 +636,12 @@ def _load_sweep_config(config_path: str, cli_output_dir: str | None = None) -> t
     if "output_dir" not in raw:
         raise ValueError("sweep config must define output_dir or CLI must pass --out_dir")
     raw["output_dir"] = _resolve_path(str(raw["output_dir"]), base_dir)
+    analysis = raw.get("analysis", {}) or {}
+    if isinstance(analysis, dict):
+        for key in ("pool_jsonl", "query_jsonl"):
+            if analysis.get(key):
+                analysis[key] = _resolve_path(str(analysis[key]), base_dir)
+        raw["analysis"] = analysis
 
     baseline = BaselineConfig(**raw.get("baseline", {}) or {})
     execution = ExecutionConfig(**raw.get("execution", {}) or {})

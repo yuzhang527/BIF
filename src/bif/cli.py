@@ -102,6 +102,12 @@ def _add_analyze_bif_parser(sub: argparse._SubParsersAction) -> None:
     p_analyze.add_argument("--out_dir", default=None)
     p_analyze.add_argument("--score_col", default=None)
     p_analyze.add_argument("--top_k", type=int, default=None)
+    p_analyze.add_argument("--pool_jsonl", default=None)
+    p_analyze.add_argument("--query_jsonl", default=None)
+    p_analyze.add_argument("--query_group_key", default=None)
+    p_analyze.add_argument("--group_top_k", type=int, default=None)
+    p_analyze.add_argument("--save_group_rankings", action="store_true")
+    p_analyze.add_argument("--save_decoded_text", action="store_true")
     p_analyze.add_argument("--enable_aux_query_plots", action="store_true")
     p_analyze.add_argument("--negate_scores", action="store_true", default=False)
     p_analyze.add_argument("--experiment_name", default=None)
@@ -194,6 +200,12 @@ def main() -> None:
         for field_name in (
             "score_col",
             "top_k",
+            "pool_jsonl",
+            "query_jsonl",
+            "query_group_key",
+            "group_top_k",
+            "save_group_rankings",
+            "save_decoded_text",
             "negate_scores",
             "enable_aux_query_plots",
             "hist_bins",
@@ -215,6 +227,7 @@ def main() -> None:
             val = getattr(args, field_name, None)
             if val is not None and not (isinstance(val, bool) and not val):
                 setattr(acfg, field_name, val)
+
         if args.convergence_checkpoints is not None:
             acfg.convergence_checkpoints = args.convergence_checkpoints
         analyze_bif_results(

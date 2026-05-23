@@ -64,6 +64,10 @@ analysis:
   top_k: 100
   enable_aux_query_plots: false
   negate_scores: false
+  query_group_key: query_group
+  group_top_k: 100
+  save_group_rankings: true
+  save_decoded_text: true
 
 # Loss trace health is expected to be monitored by existing BIF/SwanLab charts.
 # The diagnostics below focus on ranking stability.

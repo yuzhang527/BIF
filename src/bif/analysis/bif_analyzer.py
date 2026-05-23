@@ -52,6 +52,12 @@ class AnalyzeConfig:
     negate_scores: bool = False
     save_full_query_matrix: bool = False
     enable_aux_query_plots: bool = False
+    pool_jsonl: str | None = None
+    query_jsonl: str | None = None
+    query_group_key: str = "query_group"
+    save_group_rankings: bool = True
+    save_decoded_text: bool = True
+    group_top_k: int | None = None
 
     hist_bins: int | None = None
     scatter_max_points: int | None = None
@@ -147,6 +153,7 @@ def _get_dist_context() -> tuple[int, int]:
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     return rank, world_size
+
 
 
 def _init_dist_if_needed() -> None:
@@ -578,7 +585,7 @@ def compute_bif_scores(
         "cross_corr_absmean_over_queries": cross_corr_absmean,
         "cross_corr_matrix": cross_corr,
         "cross_cov_avg_over_queries": cross_cov_mean,
-
+        "bif_abs_mean": cross_corr_absmean,
         # Non-pairwise scalar diagnostics.
         "mean_loss": mean_loss,
         "self_variance": self_variance,
@@ -651,6 +658,398 @@ def build_pool_score_df(
         if isinstance(v, np.ndarray) and v.ndim == 1 and len(v) == len(pool_ids):
             df[k] = v
     return df
+
+def _safe_name(value: Any) -> str:
+    s = str(value or "unknown").strip()
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+    return s[:120] or "unknown"
+
+
+def _load_jsonl_df(path: str | None) -> pd.DataFrame | None:
+    if not path:
+        return None
+    if not os.path.exists(path):
+        print(f"[analyze] jsonl not found: {path}")
+        return None
+    rows = read_jsonl(path)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def _decode_messages_for_display(messages: Any) -> str:
+    if isinstance(messages, str):
+        try:
+            import json
+
+            messages = json.loads(messages)
+        except Exception:
+            return messages
+
+    if not isinstance(messages, list):
+        return ""
+
+    parts: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+
+        role = str(msg.get("role", "") or "").strip()
+        content = msg.get("content", "")
+
+        if isinstance(content, list):
+            content_parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    content_parts.append(str(item.get("text", item)))
+                else:
+                    content_parts.append(str(item))
+            content = " ".join(content_parts)
+
+        content = str(content or "").strip()
+
+        if role and content:
+            parts.append(f"{role}: {content}")
+        elif content:
+            parts.append(content)
+
+    return "\n".join(parts)
+
+
+def _record_to_decoded_text(record: dict[str, Any]) -> str:
+    msg_text = _decode_messages_for_display(record.get("messages"))
+    if msg_text:
+        return msg_text
+    return str(record.get("text", "") or "")
+
+
+def _attach_pool_payload(
+    score_df: pd.DataFrame,
+    pool_jsonl_df: pd.DataFrame | None,
+    save_decoded_text: bool,
+) -> pd.DataFrame:
+    out = score_df.copy()
+
+    if pool_jsonl_df is None or pool_jsonl_df.empty:
+        return out
+
+    if "sample_id" not in out.columns:
+        return out
+
+    out["sample_id"] = out["sample_id"].astype(str)
+
+    id_col = "id" if "id" in pool_jsonl_df.columns else "sample_id"
+    if id_col not in pool_jsonl_df.columns:
+        return out
+
+    payload = pool_jsonl_df.copy()
+    payload["sample_id"] = payload[id_col].astype(str)
+
+    keep_cols = ["sample_id"]
+    for col in (
+        "source",
+        "subtype",
+        "task_type",
+        "type",
+        "query_group",
+        "text",
+        "messages",
+    ):
+        if col in payload.columns:
+            keep_cols.append(col)
+
+    payload = payload[keep_cols].copy()
+
+    if save_decoded_text:
+        payload["decoded_text"] = [
+            _record_to_decoded_text(row)
+            for row in payload.to_dict(orient="records")
+        ]
+
+    rename = {
+        col: f"pool_{col}"
+        for col in payload.columns
+        if col != "sample_id" and col in out.columns
+    }
+    payload = payload.rename(columns=rename)
+
+    return out.merge(payload, on="sample_id", how="left")
+
+
+
+def _query_group_values(
+    query_ids: list[Any],
+    query_meta: dict[str, Any],
+    query_jsonl_df: pd.DataFrame | None,
+    group_key: str,
+) -> list[str]:
+    n = len(query_ids)
+    values: list[str | None] = [None] * n
+
+    # 1. 优先从 query_jsonl 里按 id 取 query_group。
+    if query_jsonl_df is not None and not query_jsonl_df.empty:
+        id_col = "id" if "id" in query_jsonl_df.columns else "sample_id"
+        candidate_cols = [
+            group_key,
+            "query_group",
+            "task_type",
+            "type",
+            "source",
+            "source_type",
+        ]
+        group_col = next(
+            (c for c in candidate_cols if c in query_jsonl_df.columns),
+            None,
+        )
+
+        if id_col in query_jsonl_df.columns and group_col is not None:
+            mapping = {}
+            for _, row in query_jsonl_df.iterrows():
+                qid = str(row[id_col])
+                val = row.get(group_col)
+                if pd.notna(val):
+                    mapping[qid] = str(val)
+
+            values = [mapping.get(str(qid)) for qid in query_ids]
+
+    # 2. fallback 到 trace meta。
+    meta_candidate_keys = [
+        group_key,
+        "query_group",
+        "query_groups",
+        "task_type",
+        "task_types",
+        "source_type",
+        "source_types",
+        "source",
+        "sources",
+    ]
+
+    for key in meta_candidate_keys:
+        seq = query_meta.get(key)
+        if not isinstance(seq, list) or len(seq) != n:
+            continue
+
+        for i, val in enumerate(seq):
+            if values[i] is None and val is not None:
+                values[i] = str(val)
+
+    return [str(v or "unknown") for v in values]
+
+def _write_group_rankings(
+    *,
+    ck_out: str,
+    ck_name: str,
+    pool_score_df: pd.DataFrame,
+    pool_jsonl_df: pd.DataFrame | None,
+    query_jsonl_df: pd.DataFrame | None,
+    loaded: dict[str, Any],
+    scores: dict[str, np.ndarray],
+    acfg: AnalyzeConfig,
+) -> None:
+    if not acfg.save_group_rankings:
+        return
+
+    cross_corr = scores.get("cross_corr_matrix")
+    if cross_corr is None:
+        print(f"[analyze] {ck_name}: no cross_corr_matrix; skip grouped ranking")
+        return
+
+    query_ids = list(loaded.get("query_ids", []))
+    query_meta = loaded.get("query_meta", {}) or {}
+
+    if len(query_ids) != cross_corr.shape[1]:
+        query_ids = list(range(cross_corr.shape[1]))
+
+    groups = _query_group_values(
+        query_ids=query_ids,
+        query_meta=query_meta,
+        query_jsonl_df=query_jsonl_df,
+        group_key=acfg.query_group_key,
+    )
+
+    group_to_indices: dict[str, list[int]] = {}
+    for idx, group in enumerate(groups):
+        group_to_indices.setdefault(str(group), []).append(idx)
+
+    if not group_to_indices:
+        return
+
+    group_root = os.path.join(ck_out, "query_groups")
+    ensure_dir(group_root)
+
+    top_k = int(acfg.group_top_k or acfg.top_k or 500)
+    bottom_k = int(acfg.bottom_k or top_k)
+
+    long_frames: list[pd.DataFrame] = []
+    summary_rows: list[dict[str, Any]] = []
+    top_sets: dict[str, set[str]] = {}
+
+    for group, qidxs in sorted(group_to_indices.items()):
+        safe_group = _safe_name(group)
+        out_dir = os.path.join(group_root, safe_group)
+        ensure_dir(out_dir)
+
+        group_scores = cross_corr[:, qidxs].mean(axis=1)
+        if acfg.negate_scores:
+            group_scores = -group_scores
+
+        gdf = pool_score_df.copy()
+
+        if "rank" in gdf.columns:
+            gdf = gdf.rename(columns={"rank": "global_rank"})
+
+        gdf["query_group"] = group
+        gdf["query_count"] = len(qidxs)
+        gdf["group_score"] = group_scores
+        gdf["cross_corr_mean_over_queries"] = group_scores
+        gdf["bif_mean"] = group_scores
+
+        # 让当前 group 的 rank 覆盖局部 rank，global rank 已经保存在 global_rank
+        gdf = gdf.sort_values(
+            "cross_corr_mean_over_queries",
+            ascending=False,
+        ).reset_index(drop=True)
+
+        gdf["group_rank"] = np.arange(1, len(gdf) + 1)
+        gdf["rank"] = gdf["group_rank"]
+
+
+        gdf = _attach_pool_payload(
+            gdf,
+            pool_jsonl_df,
+            save_decoded_text=acfg.save_decoded_text,
+        )
+
+
+        score_path = os.path.join(out_dir, "pool_scores.csv")
+        top_path = os.path.join(out_dir, f"top_{top_k}.csv")
+        bottom_path = os.path.join(out_dir, f"bottom_{bottom_k}.csv")
+
+        gdf.to_csv(score_path, index=False)
+        gdf.head(top_k).to_csv(top_path, index=False)
+        gdf.tail(bottom_k).iloc[::-1].to_csv(bottom_path, index=False)
+
+
+        long_frames.append(gdf)
+
+        top_ids = set(gdf.head(top_k)["sample_id"].astype(str).tolist())
+        top_sets[group] = top_ids
+
+        summary_rows.append(
+            {
+                "checkpoint": ck_name,
+                "query_group": group,
+                "query_count": len(qidxs),
+                "pool_count": len(gdf),
+                "score_mean": float(np.mean(group_scores)),
+                "score_std": float(np.std(group_scores)),
+                "score_min": float(np.min(group_scores)),
+                "score_max": float(np.max(group_scores)),
+                "score_path": score_path,
+                "top_path": top_path,
+                "bottom_path": bottom_path,
+            }
+        )
+
+        # SwanLab: 分组 score 分布
+        try:
+            labels, counts = _score_histogram_bars(
+                group_scores,
+                bins=int(acfg.hist_bins or 40),
+            )
+            log_bar(
+                f"2_scores/query_group_hist/{ck_name}/{safe_group}",
+                xaxis=labels,
+                series={"count": counts},
+            )
+        except Exception as exc:
+            print(f"[analyze] failed to log group histogram {group}: {exc}")
+
+        # SwanLab: top/bottom table
+        try:
+            preview_cols = [
+                c
+                for c in [
+                    "sample_id",
+                    "source",
+                    "task_type",
+                    "query_group",
+                    "cross_corr_mean_over_queries",
+                    "decoded_text",
+                    "text",
+                    "pool_text",
+                ]
+                if c in gdf.columns
+            ]
+
+            if preview_cols:
+                log_table(
+                    f"4_2_influence/query_group_top/{ck_name}/{safe_group}",
+                    dataframe=gdf.head(min(top_k, 50))[preview_cols],
+                )
+                log_table(
+                    f"4_2_influence/query_group_bottom/{ck_name}/{safe_group}",
+                    dataframe=gdf.tail(min(bottom_k, 50))[preview_cols],
+                )
+        except Exception as exc:
+            print(f"[analyze] failed to log group tables {group}: {exc}")
+
+    if long_frames:
+        all_group_df = pd.concat(long_frames, ignore_index=True)
+        all_group_df.to_csv(
+            os.path.join(ck_out, "pool_scores.by_query_group.csv"),
+            index=False,
+        )
+
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df.to_csv(
+            os.path.join(ck_out, "query_group_summary.csv"),
+            index=False,
+        )
+
+        try:
+            log_table(
+                f"4_2_influence/query_group_summary/{ck_name}",
+                dataframe=summary_df,
+            )
+        except Exception as exc:
+            print(f"[analyze] failed to log query group summary: {exc}")
+
+    # SwanLab: group top-k overlap heatmap
+    if len(top_sets) >= 2:
+        labels = list(top_sets.keys())
+        overlap = np.zeros((len(labels), len(labels)), dtype=np.float64)
+
+        for i, a in enumerate(labels):
+            for j, b in enumerate(labels):
+                union = top_sets[a] | top_sets[b]
+                inter = top_sets[a] & top_sets[b]
+                overlap[i, j] = len(inter) / max(len(union), 1)
+
+        try:
+            log_heatmap(
+                f"5_aux_query/query_group_top_overlap/{ck_name}",
+                matrix=overlap,
+                x_labels=labels,
+                y_labels=labels,
+                title=f"{ck_name} query-group top-{top_k} Jaccard overlap",
+            )
+        except TypeError:
+            # 如果当前 log_heatmap 签名不是 keyword-style，就用你仓库里的原签名改一下。
+            try:
+                log_heatmap(
+                    overlap,
+                    x_labels=labels,
+                    y_labels=labels,
+                    key=f"5_aux_query/query_group_top_overlap/{ck_name}",
+                    title=f"{ck_name} query-group top-{top_k} Jaccard overlap",
+                )
+            except Exception as exc:
+                print(f"[analyze] failed to log group overlap heatmap: {exc}")
+        except Exception as exc:
+            print(f"[analyze] failed to log group overlap heatmap: {exc}")
 
 
 def make_global_trajectory_df(
@@ -972,7 +1371,9 @@ def _process_one_checkpoint(
     acfg: AnalyzeConfig,
     ck_step: int = 0,
     pool_df: pd.DataFrame | None = None,
+    query_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
+
     t0 = __import__("time").monotonic()
 
     try:
@@ -1019,15 +1420,39 @@ def _process_one_checkpoint(
     ck_out = f"{out_dir}/{ck_name}"
     ensure_dir(ck_out)
 
-    df.to_csv(f"{ck_out}/pool_scores.csv", index=False)
-    top_k = min(int(acfg.top_k or 0), len(df))
-    bottom_k = min(int(acfg.bottom_k or 0), len(df))
+    # Attach original pool payload once, so global and group CSVs both
+    # contain decoded messages/text without duplicated merge suffixes.
+    pool_score_df = _attach_pool_payload(
+        df,
+        pool_df,
+        save_decoded_text=acfg.save_decoded_text,
+    )
 
-    top_df = df.head(top_k).copy()
-    bottom_df = df.tail(bottom_k).iloc[::-1].reset_index(drop=True)
+    pool_score_df.to_csv(f"{ck_out}/pool_scores.csv", index=False)
+
+    top_k = min(int(acfg.top_k or 0), len(pool_score_df))
+    bottom_k = min(int(acfg.bottom_k or 0), len(pool_score_df))
+
+    top_df = pool_score_df.head(top_k).copy()
+    bottom_df = pool_score_df.tail(bottom_k).iloc[::-1].reset_index(drop=True)
 
     top_df.to_csv(f"{ck_out}/top_{top_k}.csv", index=False)
     bottom_df.to_csv(f"{ck_out}/bottom_{bottom_k}.csv", index=False)
+
+    _write_group_rankings(
+        ck_out=ck_out,
+        ck_name=ck_name,
+        pool_score_df=pool_score_df,
+        # Already attached above; avoid attaching the same payload twice.
+        pool_jsonl_df=None,
+        query_jsonl_df=query_df,
+        loaded=loaded,
+        scores=scores,
+        acfg=acfg,
+    )
+
+
+
 
     # New canonical matrix: pool × query.
     pool_query_matrix_path = f"{ck_out}/pool_query_corr_matrix.npy"
@@ -1101,7 +1526,7 @@ def _process_one_checkpoint(
         )
 
         _log_score_by_source(
-            df,
+            pool_score_df,
             acfg.score_col,
             acfg.top_k,
             ck_name,
@@ -1150,7 +1575,7 @@ def _process_one_checkpoint(
             )
 
         _log_checkpoint_sample_table(
-            df,
+            pool_score_df,
             acfg.score_col,
             acfg.top_k,
             ck_name,
@@ -1166,8 +1591,8 @@ def _process_one_checkpoint(
         "pool_size": len(loaded["pool_ids"]),
         "query_size": len(loaded.get("query_ids", [])),
         "score_definition": "cross_corr_mean_over_queries",
-        "score_mean": float(df[acfg.score_col].mean()),
-        "score_std": float(df[acfg.score_col].std()),
+        "score_mean": float(pool_score_df[acfg.score_col].mean()),
+        "score_std": float(pool_score_df[acfg.score_col].std()),
         "analysis_seconds": round(elapsed, 2),
     }
 
@@ -2261,30 +2686,47 @@ def analyze_bif_results(
     all_ckpts = discover_checkpoint_dirs(bif_root)
     names = [x[0] for x in all_ckpts]
 
-    pool_df: pd.DataFrame | None = None
-    for pool_name in ("pt_pool.jsonl", "pool_10k_rebalanced.jsonl"):
-        pool_path = os.path.join(bif_root, "..", "pool", pool_name)
-        if os.path.exists(pool_path):
-            pool_df = pd.DataFrame(read_jsonl(pool_path))
-            break
+    pool_df: pd.DataFrame | None = _load_jsonl_df(acfg.pool_jsonl)
+    query_df: pd.DataFrame | None = _load_jsonl_df(acfg.query_jsonl)
 
     if pool_df is None:
-        search_dirs = [bif_root]
-        parent = os.path.dirname(bif_root)
-        for _ in range(3):
-            if parent and parent != "/":
-                search_dirs.append(parent)
-                parent = os.path.dirname(parent)
-        import json as _json
-        for search_dir in search_dirs:
-            run_cfg_path = os.path.join(search_dir, "run_config.json")
-            if os.path.exists(run_cfg_path):
-                with open(run_cfg_path) as _f:
-                    _run_cfg = _json.load(_f)
-                _pool_jsonl = _run_cfg.get("pool_jsonl", "")
-                if _pool_jsonl and os.path.exists(_pool_jsonl):
-                    pool_df = pd.DataFrame(read_jsonl(_pool_jsonl))
-                    break
+        for pool_name in ("pt_pool.jsonl", "pool_10k_rebalanced.jsonl"):
+            pool_path = os.path.join(bif_root, "..", "pool", pool_name)
+            if os.path.exists(pool_path):
+                pool_df = pd.DataFrame(read_jsonl(pool_path))
+                break
+
+    # Fallback: try run_config.json from bif_root and parents.
+    search_dirs = [bif_root]
+    parent = os.path.dirname(bif_root)
+    for _ in range(3):
+        if parent and parent != "/":
+            search_dirs.append(parent)
+            parent = os.path.dirname(parent)
+
+    import json as _json
+
+    for search_dir in search_dirs:
+        run_cfg_path = os.path.join(search_dir, "run_config.json")
+        if not os.path.exists(run_cfg_path):
+            continue
+
+        with open(run_cfg_path, encoding="utf-8") as _f:
+            _run_cfg = _json.load(_f)
+
+        if pool_df is None:
+            _pool_jsonl = _run_cfg.get("pool_jsonl", "")
+            if _pool_jsonl and os.path.exists(_pool_jsonl):
+                pool_df = pd.DataFrame(read_jsonl(_pool_jsonl))
+
+        if query_df is None:
+            _query_jsonl = _run_cfg.get("query_jsonl", "")
+            if _query_jsonl and os.path.exists(_query_jsonl):
+                query_df = pd.DataFrame(read_jsonl(_query_jsonl))
+
+        if pool_df is not None and query_df is not None:
+            break
+
 
     _auto_adapt_from_first_checkpoint(acfg, all_ckpts, pool_df)
 
@@ -2310,7 +2752,9 @@ def analyze_bif_results(
             acfg,
             ck_step=ck_step,
             pool_df=pool_df,
+            query_df=query_df,
         )
+
         summary_rows_local.append(row)
 
     _barrier()
@@ -2379,6 +2823,32 @@ def main() -> None:
     parser.add_argument("--bif_root", required=True)
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--score_col", default=None)
+    parser.add_argument("--pool_jsonl", default=None)
+    parser.add_argument("--query_jsonl", default=None)
+    parser.add_argument("--query_group_key", default=None)
+    parser.add_argument("--group_top_k", type=int, default=None)
+    parser.add_argument(
+        "--save_group_rankings",
+        dest="save_group_rankings",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no_save_group_rankings",
+        dest="save_group_rankings",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--save_decoded_text",
+        dest="save_decoded_text",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no_save_decoded_text",
+        dest="save_decoded_text",
+        action="store_false",
+    )
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--save_full_query_matrix", action="store_true")
     parser.add_argument("--enable_aux_query_plots", action="store_true")
@@ -2395,6 +2865,18 @@ def main() -> None:
         acfg.score_col = args.score_col
     if args.top_k is not None:
         acfg.top_k = args.top_k
+    if args.pool_jsonl is not None:
+        acfg.pool_jsonl = args.pool_jsonl
+    if args.query_jsonl is not None:
+        acfg.query_jsonl = args.query_jsonl
+    if args.query_group_key is not None:
+        acfg.query_group_key = args.query_group_key
+    if args.group_top_k is not None:
+        acfg.group_top_k = args.group_top_k
+    if args.save_group_rankings is not None:
+        acfg.save_group_rankings = args.save_group_rankings
+    if args.save_decoded_text is not None:
+        acfg.save_decoded_text = args.save_decoded_text
     if args.save_full_query_matrix:
         acfg.save_full_query_matrix = True
     if args.enable_aux_query_plots:
